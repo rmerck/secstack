@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# hexstrike-ctl start|stop|status: HexStrike API in the Kali container, 127.0.0.1:8888 only.
+# status checks /health (the only endpoint open without the API token), that a request without the
+# token is refused, and that ours ($SECOPS/env/hexstrike-token, new for every container) is accepted.
+# The token goes from the file to curl's stdin (-H @-): never on a command line, into a shell variable or
+# into a `bash -x` trace. curl never uses a proxy here: one could fake the answers.
+export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
+GH="${SECSTACK_GH:-$HOME/GitHub}"; SECOPS="${SECOPS:-$GH/.sec-ops}"
+TOKEN_FILE="$SECOPS/env/hexstrike-token"
+API=http://127.0.0.1:8888
+# HTTP status for a path no route serves. The token check runs before routing: 401 = no or wrong
+# token, 404 = token accepted. Extra curl options (-H @-) go in front.
+api_status(){ curl -s --noproxy '*' -m 3 -o /dev/null -w '%{http_code}' "$@" "$API/api/secstack-auth-check" 2>/dev/null; }
+case "${1:-}" in
+  start)  exec "$(dirname "$0")/secstack" mcp on ;;
+  stop)   exec "$(dirname "$0")/secstack" mcp off ;;
+  status) docker ps --filter name=^hexstrike$ --format '{{.Names}} {{.Status}} {{.Ports}}' 2>/dev/null | grep . || echo "hexstrike: stopped"
+          if ! curl -fsS --noproxy '*' -m 3 "$API/health" >/dev/null 2>&1; then echo "health: no response"; exit 1; fi
+          echo "health: OK"
+          anon=$(api_status)
+          # Only 401 means protected. An image built before the token check answers 404 (no such route).
+          case "$anon" in
+            401) ;;
+            000|"") echo "api: no response"; exit 1 ;;
+            *) echo "api: NOT protected (HTTP $anon without a token): rebuild the image (./setup.sh --only images), then: hexstrike-ctl start"; exit 1 ;;
+          esac
+          if ! head -n 1 "$TOKEN_FILE" 2>/dev/null | grep -qxE '[0-9a-f]{64}'; then
+            echo "api: token required; no valid token in $TOKEN_FILE (hexstrike-ctl start writes one)"; exit 1
+          fi
+          ours=$({ printf 'X-Secstack-Token: '; head -n 1 "$TOKEN_FILE"; } | api_status -H @-)
+          case "$ours" in
+            404|200) echo "api: token required; ours accepted" ;;
+            401) echo "api: token required; ours refused (restart with: hexstrike-ctl start)"; exit 1 ;;
+            *) echo "api: no answer to the token check (HTTP ${ours:-none})"; exit 1 ;;
+          esac ;;
+  *) echo "usage: hexstrike-ctl start|stop|status"; exit 1 ;;
+esac

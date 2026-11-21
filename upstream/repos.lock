@@ -1,0 +1,6 @@
+# name  url  commit  (commit date): exact versions running on 2026-11-20
+pentagi       https://github.com/vxcontrol/pentagi.git      cffed9485aa1cca70762cd08a57ac62a80406258  # 2026-10-23
+ARTEX         https://github.com/BaaRai/ARTEX.git           65045efae642159eeef3be5536c262f096f4c08d  # 2026-11-18
+hexstrike-ai  https://github.com/0x4m4/hexstrike-ai.git     d689933ff579d839c676c82b231f8e98326c5f04  # 2026-08-03
+kali-mcp      https://github.com/evilbotnet/kali-mcp.git    473112c0c44c49a4b4972cf0d72e30e3d2f37f89  # 2025-07-20
+5ire          https://github.com/nanbingxyz/5ire.git        12c6a0859734f72476fb7f55da6dd5404f585c24  # 2026-11-05

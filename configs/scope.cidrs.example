@@ -1,0 +1,7 @@
+# In-scope destinations for containers on pentest-net (pentagi Kali terminals) and hexstrike-net (hexstrike).
+# One CIDR per line; everything else is rejected at the Docker VM firewall. IPv4 only, /16 or narrower.
+# Edit with: secstack scope add <cidr> [note] | secstack scope rm <cidr>   (re-applied automatically)
+# The live copy is $SECOPS/configs/scope.cidrs (600, gitignored). Only add hosts you are authorized to test.
+# The local lab (DVWA, Juice Shop: 172.30.0.10/.11 from pentest-net, 172.30.1.10/.11 from hexstrike-net) is
+# always reachable and needs no entry here: both networks (172.30.0.0/24, 172.30.1.0/24) are reserved, so a
+# line for either is refused.

@@ -1,0 +1,6 @@
+# Host-side venv at $SECOPS/venv (~/GitHub/.sec-ops/venv, Python 3.12), synced by scripts/bootstrap-upstream.sh.
+# Used by: hexstrike_mcp.py (MCP client for 5ire/Claude), mcp/pentagi-bridge, bin/secops-flow.py, bin/toolcall-test.py.
+# Versions as installed 2026-11-20.
+mcp==1.30.0
+requests==2.34.2
+urllib3==2.8.0

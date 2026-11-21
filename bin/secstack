@@ -1,0 +1,1640 @@
+#!/usr/bin/env bash
+# secstack v10: offensive-security workstation control for Apple Silicon Macs.
+# Local, abliterated models only. All listeners on loopback. Nothing runs unless you start it.
+# Per-machine sizing (models, context, Docker VM, fences) comes from configs/stack.conf, written by
+# scripts/plan.py from this Mac's hardware. Without it, the 48 GB reference profile below applies.
+# Tool containers live on pentest-net (pentagi Kali terminals) and hexstrike-net (hexstrike alone); the lab
+# is on both. A firewall chain inside the Docker VM lets them open connections only to the lab and
+# configs/scope.cidrs. ARTEX, pentagi itself, its scraper and SearXNG are on neither network and are not
+# scope-limited (see docs/ARCHITECTURE.md).
+set -uo pipefail
+umask 077
+
+GH="${SECSTACK_GH:-$HOME/GitHub}"            # parent folder holding the upstream clones
+SECOPS="${SECOPS:-$GH/.sec-ops}"              # runtime root (700): env/ logs/ reports/ run/ + symlinks into the repo
+export SECSTACK_GH="$GH" SECOPS               # helpers (secops-flow, bench, bridge) read the same roots
+LOG="$SECOPS/logs"
+CFG="$SECOPS/configs"
+RUN="$SECOPS/run"
+# Fallback locations for docker/ollama/brew tools, appended so a PATH the caller set up wins.
+for _d in /Applications/Docker.app/Contents/Resources/bin /Applications/Ollama.app/Contents/Resources \
+          /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" /usr/sbin /sbin; do
+  case ":$PATH:" in *":$_d:"*) ;; *) PATH="$PATH:$_d" ;; esac
+done
+export PATH
+# Loopback traffic (Ollama, pentagi, hexstrike, lab) never goes through an HTTP proxy.
+export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}" no_proxy="127.0.0.1,localhost,::1${no_proxy:+,$no_proxy}"
+CLAUDE_CFG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+OLLAMA="$(command -v ollama 2>/dev/null || echo /usr/local/bin/ollama)"
+PYH="$SECOPS/venv/bin/python3"                 # hash-locked host venv (scripts/bootstrap-upstream.sh)
+FLOWPY="$SECOPS/bin/secops-flow.py"
+# Resolve this script through any symlinks (bin dir or the file itself) to find the repo.
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd -P)"; _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_dir/$_src" ;; esac
+done
+REPO_DIR="$(cd -P "$(dirname "$_src")/.." && pwd -P)"   # -P: resolve the bin symlink before going up
+PLANPY="$REPO_DIR/scripts/plan.py"
+IMAGES_LOCK="$REPO_DIR/upstream/images.lock"
+SEC_PORTS="8787 8788 8443 9443 5432 9187 8888 11434 11435 8000 8081 8082"
+EMBED_PORT=11435   # dedicated Ollama for embeddings so they never evict the resident chat model
+PENTEST_NET=pentest-net; PENTEST_SUBNET=172.30.0.0/24; PENTEST_GW=172.30.0.1; PENTEST_BR=br-pentest
+PENTEST_DYNAMIC=172.30.0.128/25   # addresses Docker hands out; fixed ones (.10/.11 lab) stay below
+LAB_RANGE=172.30.0.8/29           # lab containers may answer but never open connections
+# HexStrike gets its own bridge, which no Kali terminal ever joins: on a shared bridge, a terminal with NET_RAW
+# can take over HexStrike's address (forged ARP or source MAC). The lab sits on both bridges, at fixed addresses.
+HEXSTRIKE_NET=hexstrike-net; HEXSTRIKE_SUBNET=172.30.1.0/24; HEXSTRIKE_GW=172.30.1.1; HEXSTRIKE_BR=br-hexstrike
+HEXSTRIKE_DYNAMIC=172.30.1.128/25; HEXSTRIKE_IP=172.30.1.5
+LAB_RANGE_HEX=172.30.1.8/29       # the lab's hexstrike-net addresses (.10/.11)
+SCOPE_BRIDGES="$PENTEST_BR $HEXSTRIKE_BR"
+SCOPE_FILE="$CFG/scope.cidrs"; SCOPE_MODE_FILE="$CFG/scope.mode"
+STACK_CONF="$CFG/stack.conf"
+# alpine runs privileged inside the Docker VM to program the firewall: digest-pinned, never a tag.
+ALPINE_PINNED="alpine@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf"
+# conf KEY DEFAULT: value from stack.conf when present and made of safe characters. Never sourced.
+# Same rules as plan.py read_conf(): last occurrence wins, one trailing CR stripped, empty or unsafe = absent.
+conf(){
+  local v=""
+  [ -f "$STACK_CONF" ] && v=$(grep -E "^$1=" "$STACK_CONF" 2>/dev/null | tail -1 | cut -d= -f2-)
+  v=${v%$'\r'}
+  case "$v" in ""|-*|*[!A-Za-z0-9._:/,-]*) printf '%s\n' "$2" ;; *) printf '%s\n' "$v" ;; esac
+}
+# num VALUE DEFAULT [MAX]: positive integer without leading zeros, at most MAX; else DEFAULT.
+num(){
+  case "$1" in ""|0*|*[!0-9]*) printf '%s\n' "$2"; return ;; esac
+  if [ "${#1}" -gt 7 ] || { [ -n "${3:-}" ] && [ "$1" -gt "$3" ]; }; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi
+}
+# img KEY DEFAULT: container image reference from upstream/images.lock (pinned digests when available).
+img(){
+  local v=""
+  [ -f "$IMAGES_LOCK" ] && v=$(grep -E "^$1=" "$IMAGES_LOCK" 2>/dev/null | tail -1 | cut -d= -f2-)
+  v=${v%$'\r'}
+  case "$v" in ""|-*|*[!A-Za-z0-9._/:@-]*) printf '%s\n' "$2" ;; *) printf '%s\n' "$v" ;; esac
+}
+ALPINE_IMAGE=$(img ALPINE_IMAGE "$ALPINE_PINNED")
+# Models (Ollama aliases). Defaults = the 48 GB reference profile. "none" = slot not used.
+CHAT_MODEL=$(conf CHAT_MODEL qwen3.6-35b-a3b-abliterated)   # workhorse: agents + tool use
+DEEP_MODEL=$(conf DEEP_MODEL qwen3.8-27b-abliterated)       # careful reasoning / adviser
+ALT_MODEL=$(conf ALT_MODEL gemma4-26b-abliterated)          # second family + vision
+EMBED_MODEL=$(conf EMBED_MODEL nomic-embed-text)
+MODELS_CSV=$(conf MODELS "$CHAT_MODEL,$DEEP_MODEL,$ALT_MODEL")
+MODEL_BUDGET_GB=$(num "$(conf MODEL_BUDGET_GB 75)" 75)
+MAX_CHAT_MODELS=$(num "$(conf MAX_CHAT_MODELS 3)" 3 3)
+CTX=$(num "$(conf OLLAMA_CONTEXT_LENGTH 32768)" 32768 262144)
+PARALLEL=$(num "$(conf OLLAMA_NUM_PARALLEL 2)" 2 8)
+KV_TYPE=$(conf OLLAMA_KV_CACHE_TYPE q8_0)
+case "$KV_TYPE" in f16|q8_0|q4_0) ;; *) KV_TYPE=q8_0 ;; esac
+FENCE_GB=$(num "$(conf INFERENCE_FENCE_GB 24)" 24)
+RAM_GB=$(num "$(conf RAM_GB 48)" 48)
+OS_RESERVE_GB=$(num "$(conf OS_RESERVE_GB 8)" 8)
+DOCKER_VM_GB=$(num "$(conf DOCKER_VM_GB 16)" 16 64)
+DOCKER_VM_CPUS=$(num "$(conf DOCKER_VM_CPUS 8)" 8 64)
+HEX_CPUS=$(num "$(conf HEXSTRIKE_CPUS 4)" 4 "$DOCKER_VM_CPUS")
+HEX_MEM_GB=$(num "$(conf HEXSTRIKE_MEM_GB 4)" 4 "$DOCKER_VM_GB")
+models_list(){ printf '%s\n' "$MODELS_CSV" | tr ',' '\n' | grep -Ev '^(none)?$' || true; }   # macOS regex rejects empty alternatives
+mkdir -p "$LOG" "$RUN"
+
+c_ok(){ printf "\033[32m✔\033[0m %s\n" "$*"; }
+c_warn(){ printf "\033[33m!\033[0m %s\n" "$*"; }
+c_bad(){ printf "\033[31m✘\033[0m %s\n" "$*"; }
+c_err(){ printf "\033[31m✘\033[0m %s\n" "$*" >&2; }   # failures that must show even when stdout is hidden
+hdr(){ printf "\n\033[1m== %s ==\033[0m\n" "$*"; }
+
+docker_up(){
+  docker info >/dev/null 2>&1 && return 0
+  echo "Starting Docker Desktop..."; open -a Docker
+  for _ in $(seq 1 45); do
+    if docker info >/dev/null 2>&1; then pentest_quarantine; return 0; fi
+    sleep 2
+  done
+  c_err "Docker did not start"; return 1
+}
+# Docker was just started by secstack, so the VM has no scope firewall yet. Anything running on pentest-net
+# came back by itself (a restart policy): kill it (a terminal's PID 1 ignores SIGTERM, so `docker stop` would
+# leave it 10 s with open egress), and clear the restart policies (pentest_no_restart).
+pentest_quarantine(){
+  local ids
+  ids=$(docker ps -q --filter "network=$PENTEST_NET" --filter "network=$HEXSTRIKE_NET" 2>/dev/null)
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086
+    docker kill $ids >/dev/null 2>&1
+    c_warn "stopped container(s) that came back on $PENTEST_NET or $HEXSTRIKE_NET with Docker, before the scope firewall: $(echo $ids)" >&2
+  fi
+  pentest_no_restart
+  ids=$(docker ps -q --filter "network=$PENTEST_NET" --filter "network=$HEXSTRIKE_NET" 2>/dev/null)   # one that started in the meantime
+  # shellcheck disable=SC2086
+  [ -z "$ids" ] || docker kill $ids >/dev/null 2>&1
+  return 0
+}
+# The restart guard: while pentagi runs, `docker events` reports every container created or connected to a
+# network, and each report re-runs pentest_no_restart. pentagi gives its Kali terminals restart policy
+# on-failure:5, and dockerd restarts such a container when it starts again (a reboot, Docker Desktop's restart
+# or update), before any scope firewall exists. Started by `secstack pentagi`; stopped with pentagi (stop,
+# down, artex); it ends by itself when Docker stops.
+RESTART_GUARD_PID="$RUN/restart-guard.pid"
+restart_guard_alive(){ pid_cmd_is "$RESTART_GUARD_PID" 'secstack _restart-guard$'; }
+restart_guard_start(){
+  restart_guard_alive && return 0
+  nohup "$BASH" "$REPO_DIR/bin/secstack" _restart-guard >"$LOG/restart-guard.log" 2>&1 &
+  echo $! > "$RESTART_GUARD_PID"
+}
+restart_guard_stop(){
+  local pid
+  if restart_guard_alive; then
+    pid=$(cat "$RESTART_GUARD_PID"); kill "$pid" 2>/dev/null
+    for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  fi
+  rm -f "$RESTART_GUARD_PID"
+}
+restart_guard_run(){ # `secstack _restart-guard`: the listener itself
+  local fifo="$RUN/restart-guard.fifo" ev rd
+  rm -f "$fifo"; mkfifo -m 600 "$fifo" || return 1
+  docker events --filter type=container --filter event=create --filter type=network --filter event=connect \
+    --format '{{.Type}} {{.Action}}' >"$fifo" 2>/dev/null &
+  ev=$!
+  while read -r _; do pentest_no_restart; done <"$fifo" &
+  rd=$!
+  trap 'kill "$ev" "$rd" 2>/dev/null; rm -f "$fifo"; exit 0' TERM HUP INT
+  pentest_no_restart                   # whatever was created before the listener started
+  wait "$ev"                           # docker events ends when Docker stops
+  kill "$rd" 2>/dev/null; rm -f "$fifo"
+}
+
+# ---------- pentest network + scope enforcement ----------
+# The firewall matches traffic by bridge name; a network of one of these names created some other way
+# (other driver or bridge name, IPv6 on, no dynamic range) would bypass or break it, so it is refused.
+net_check_one(){ # NAME BRIDGE SUBNET RANGE
+  local info want="bridge $2 $3 $4 false"
+  info=$(docker network inspect "$1" --format \
+    '{{.Driver}} {{index .Options "com.docker.network.bridge.name"}} {{range .IPAM.Config}}{{.Subnet}} {{.IPRange}}{{end}} {{.EnableIPv6}}' 2>/dev/null)
+  [ "$info" = "$want" ] && return 0
+  [ -n "$info" ] || { c_err "$1 doesn't exist yet: secstack scope apply creates it"; return 1; }
+  c_err "$1 isn't the network secstack creates (driver/bridge/subnet/range/IPv6: $info; want: $want)"
+  echo "  Recreate it: secstack stop && docker network rm $1 && secstack scope apply && secstack lab reset" >&2
+  return 1
+}
+net_check(){
+  net_check_one "$PENTEST_NET" "$PENTEST_BR" "$PENTEST_SUBNET" "$PENTEST_DYNAMIC" \
+    && net_check_one "$HEXSTRIKE_NET" "$HEXSTRIKE_BR" "$HEXSTRIKE_SUBNET" "$HEXSTRIKE_DYNAMIC"
+}
+net_create(){ # NAME BRIDGE SUBNET RANGE GATEWAY, unless it exists
+  docker network inspect "$1" >/dev/null 2>&1 && return 0
+  docker network create --driver bridge --ipv6=false --subnet "$3" --ip-range "$4" \
+    --gateway "$5" -o com.docker.network.bridge.name="$2" "$1" >/dev/null \
+    || { c_err "couldn't create $1"; return 1; }
+  c_ok "created $1 ($3, no IPv6)"
+}
+net_ensure(){
+  net_create "$PENTEST_NET" "$PENTEST_BR" "$PENTEST_SUBNET" "$PENTEST_DYNAMIC" "$PENTEST_GW" \
+    && net_create "$HEXSTRIKE_NET" "$HEXSTRIKE_BR" "$HEXSTRIKE_SUBNET" "$HEXSTRIKE_DYNAMIC" "$HEXSTRIKE_GW" && net_check
+}
+# Run a shell script (stdin) inside the Docker Desktop VM's root namespaces.
+alpine_pinned(){ case "$ALPINE_IMAGE" in *@sha256:*) return 0 ;; esac; c_err "ALPINE_IMAGE must be pinned by digest (upstream/images.lock)"; return 1; }
+vm_sh(){
+  alpine_pinned || return 1
+  docker run --rm -i --privileged --pid=host --net=host "$ALPINE_IMAGE" nsenter -t 1 -m -u -n -i sh -s
+}
+# The Docker VM's own uplink network (192.168.65.0/24 unless changed in Docker Desktop's settings) holds
+# host.docker.internal, so it is reserved like RESERVED_NETS. VM_UPLINK_SH prints "uplink ADDR/LEN" lines
+# for the default route's interface (busybox sh in the VM); uplink_nets turns them into networks.
+VM_UPLINK_SH='d=$(ip -4 route show default 2>/dev/null | sed -n "s/.* dev \([^ ]*\).*/\1/p" | head -n 1); [ -n "$d" ] && ip -4 addr show dev "$d" 2>/dev/null | sed -n "s/^ *inet \([0-9.]*\/[0-9]*\).*/uplink \1/p"'
+uplink_nets(){ # stdin: VM output; prints the uplink networks, space separated (nothing if none)
+  python3 -c '
+import ipaddress, sys
+nets = []
+for line in sys.stdin:
+    p = line.split()
+    if len(p) == 2 and p[0] == "uplink":
+        try:
+            n = ipaddress.ip_interface(p[1]).network
+        except ValueError:
+            continue
+        if n.version == 4 and str(n) not in nets:
+            nets.append(str(n))
+print(" ".join(nets))'
+}
+vm_uplink_nets(){ alpine_pinned || return 1; printf '%s\n' "$VM_UPLINK_SH" "true" | vm_sh | uplink_nets; }   # docker's own errors show
+# A container on pentest-net or hexstrike-net that restarts with Docker would run before any firewall exists
+# (a Docker restart wipes it), so every one of them, running or stopped, gets restart policy "no" (--rm ones
+# can't have a policy). Best effort: warns, always returns 0.
+pentest_no_restart(){
+  local id ids line name pol rm
+  ids=$(docker ps -aq --filter "network=$PENTEST_NET" --filter "network=$HEXSTRIKE_NET" 2>/dev/null) \
+    || { c_warn "couldn't list the containers on $PENTEST_NET and $HEXSTRIKE_NET to clear their restart policies" >&2; return 0; }
+  for id in $ids; do
+    line=$(docker inspect "$id" --format '{{.Name}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.AutoRemove}}' 2>/dev/null) \
+      || { c_warn "couldn't read the restart policy of container $id" >&2; continue; }
+    IFS='|' read -r name pol rm <<EOF
+$line
+EOF
+    case "$pol" in ""|no) continue ;; esac
+    [ "$rm" = true ] && continue
+    docker update --restart=no "$id" >/dev/null 2>&1 \
+      || c_warn "couldn't set restart=no on ${name#/} ($pol): it may start with Docker before the scope firewall" >&2
+  done
+  return 0
+}
+# Normalized in-scope networks: only valid IPv4 CIDRs of /16 or narrower ever reach iptables.
+# (A line like "10.0.0.6/32#web", or one with CRLF or odd spaces, is cleaned, never passed through raw.)
+scope_cidrs(){
+  python3 -c '
+import ipaddress, sys
+for line in open(sys.argv[1], errors="replace"):
+    tok = line.split("#")[0].strip()
+    if not tok:
+        continue
+    try:
+        net = ipaddress.ip_network(tok, strict=False)
+    except ValueError:
+        continue
+    if net.version == 4 and net.prefixlen >= 16:
+        print(net)
+' "$SCOPE_FILE" 2>/dev/null
+}
+# Networks that may never be in scope: Docker Desktop's default subnet (host.docker.internal reaches the
+# Mac's loopback services through it), loopback, link-local, multicast/reserved, and pentest-net and
+# hexstrike-net themselves (the lab is always reachable without a scope entry). The VM's actual uplink
+# network is added at apply.
+RESERVED_NETS="192.168.65.0/24 127.0.0.0/8 169.254.0.0/16 0.0.0.0/8 224.0.0.0/4 240.0.0.0/4 172.30.0.0/24 172.30.1.0/24"
+# Rules outside SECOPS-SCOPE, per bridge, written exactly as `iptables -S` prints them (the read-back
+# compares text): the hooks are DOCKER-USER's first rules, the guards are there only during an apply, and the
+# INPUT rules (no new connection from either bridge to the VM's own addresses) are INPUT's first rules.
+scope_hook(){ echo "-i $1 -j SECOPS-SCOPE"; }
+scope_guard(){ echo "-i $1 -j REJECT --reject-with icmp-net-prohibited"; }
+scope_input(){ echo "-i $1 -m conntrack ! --ctstate RELATED,ESTABLISHED -j REJECT --reject-with icmp-port-unreachable"; }
+SCOPE_FORWARD="-j DOCKER-USER"   # FORWARD's first rule: anything above it would see bridge traffic first
+reserved_nets(){ # [UPLINK_NETS]: RESERVED_NETS plus the VM's uplink networks, one per line
+  local p all="$RESERVED_NETS"
+  for p in ${1:-}; do case " $all " in *" $p "*) ;; *) all="$all $p" ;; esac; done
+  printf '%s\n' $all
+}
+scope_validate(){ # [UPLINK_NETS]
+  python3 - "$SCOPE_FILE" "$(reserved_nets "${1:-}" | tr '\n' ' ')" <<'PY'
+import ipaddress, sys
+ok = True
+reserved = [ipaddress.ip_network(r) for r in sys.argv[2].split()]
+try:
+    lines = open(sys.argv[1], errors="replace").readlines()
+except FileNotFoundError:
+    lines = []
+for n, line in enumerate(lines, 1):
+    tok = line.split("#")[0].strip()
+    if not tok:
+        continue
+    try:
+        net = ipaddress.ip_network(tok, strict=False)
+    except ValueError:
+        print(f"  line {n}: not a CIDR: {tok}"); ok = False; continue
+    if net.version != 4:
+        print(f"  line {n}: IPv4 only: {tok}"); ok = False
+    elif net.prefixlen < 16:
+        print(f"  line {n}: refusing scope broader than /16: {tok}"); ok = False
+    elif any(net.overlaps(r) for r in reserved):
+        hit = ", ".join(str(r) for r in reserved if net.overlaps(r))
+        print(f"  line {n}: {net} overlaps a reserved range ({hit}); remove it: secstack scope rm {net}"); ok = False
+sys.exit(0 if ok else 1)
+PY
+}
+# scope_rules MODE "UPLINK_NETS" "CIDRS": the SECOPS-SCOPE chain in order, one rule per line, exactly as
+# `iptables -S` prints it back (checked against iptables-legacy and iptables-nft). Used to write the
+# chain and to read it back.
+scope_rules(){
+  local p rej="-j REJECT --reject-with icmp-net-prohibited"
+  # Anti-spoofing: a packet from a bridge must carry a source address of that bridge. A terminal (NET_RAW) could
+  # otherwise forge a "reply" from any address into a HexStrike connection, and the REPLY rule below would pass
+  # it. Dropped, not rejected: a rejection would go to the forged address.
+  echo "! -s $PENTEST_SUBNET -i $PENTEST_BR -j DROP"
+  echo "! -s $HEXSTRIKE_SUBNET -i $HEXSTRIKE_BR -j DROP"
+  # Replies to connections made to the bridges (published ports, the VM). A connection a container opened
+  # is matched by the rules below on every packet, so narrowing the scope also cuts open connections.
+  echo "-m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN"
+  # The lab may answer but sends nothing else: no new connection, and none it opened while the firewall was off.
+  echo "-s $LAB_RANGE $rej"
+  echo "-s $LAB_RANGE_HEX $rej"
+  # Inside each bridge new connections reach only the lab: not HexStrike, not each other.
+  echo "-d $LAB_RANGE -i $PENTEST_BR -o $PENTEST_BR -j RETURN"
+  echo "-d $LAB_RANGE_HEX -i $HEXSTRIKE_BR -o $HEXSTRIKE_BR -j RETURN"
+  for p in $(reserved_nets "$2"); do echo "-d $p $rej"; done
+  for p in $3; do echo "-d $p -j RETURN"; done
+  if [ "$1" = install ]; then
+    for p in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do echo "-d $p $rej"; done
+    echo "-p tcp -m multiport --dports 80,443 -j RETURN"
+  fi
+  echo "$rej"
+}
+# One firewall change at a time on this Mac: prep, pentagi, lab, mcp on and scope ... may run at once in two
+# terminals, and an apply removes every guard rule (the other apply's too), so two at once can leave both
+# bridges open. mkdir is atomic (macOS has no flock). The lock holds its owner's pid; a lock whose owner is
+# gone (killed mid-apply) is taken over. Waits up to 2 minutes.
+SCOPE_LOCK="$RUN/scope.lock"
+scope_lock(){
+  local _ nopid=0
+  for _ in $(seq 1 240); do
+    mkdir "$SCOPE_LOCK" 2>/dev/null && { echo "$$" > "$SCOPE_LOCK/pid"; return 0; }
+    if [ -s "$SCOPE_LOCK/pid" ]; then
+      nopid=0
+      pid_cmd_is "$SCOPE_LOCK/pid" 'secstack' || { rm -rf "$SCOPE_LOCK"; continue; }   # no live secstack: stale
+    else
+      # An owner writes its pid right after its mkdir: none for 3 s means it died in between.
+      nopid=$((nopid + 1)); [ $nopid -lt 6 ] || { rm -rf "$SCOPE_LOCK"; nopid=0; continue; }
+    fi
+    sleep 0.5
+  done
+  c_err "another secstack command has been changing the scope firewall for 2 minutes (pid $(cat "$SCOPE_LOCK/pid" 2>/dev/null), lock $SCOPE_LOCK); try again when it is done"
+  return 1
+}
+scope_unlock(){ rm -rf "$SCOPE_LOCK"; }
+scope_apply(){ # [strict|install] [flush]: scope_apply_now under the scope lock
+  local rc
+  docker_up || return 1   # outside the lock: starting Docker can take a minute
+  scope_lock || return 1
+  scope_apply_now "$@"; rc=$?
+  scope_unlock
+  return $rc
+}
+# scope_guards_first BRIDGE...: DOCKER-USER (read from the VM now) starts with these bridges' guard rules, in
+# this order. A failed apply says traffic "stays blocked" only when its guards really are still there.
+scope_guards_first(){
+  local want="" b
+  for b in "$@"; do want="$want-A DOCKER-USER $(scope_guard "$b")
+"; done
+  [ "$(echo "iptables -w 10 -S DOCKER-USER" | vm_sh 2>/dev/null | grep '^-A ' | head -n $#)
+" = "$want" ]
+}
+scope_apply_now(){ # [strict|install] [flush]   (default mode: the saved one)
+  local mode="${1:-$(cat "$SCOPE_MODE_FILE" 2>/dev/null || echo strict)}" flush="${2:-}"
+  case "$mode" in strict|install) ;; *) c_err "scope mode must be strict or install"; return 1;; esac
+  # Strict is recorded before trying, so a failed `scope strict` can't let a later apply reopen install mode.
+  if [ "$mode" = strict ]; then ( umask 077; echo strict > "$SCOPE_MODE_FILE" ); fi
+  docker_up || return 1; net_ensure || return 1
+  local probe up fresh=0 cidrs spec n=0 total out out2="" rc st b p1 p2 one two ipt="iptables -w 10" R
+  # One look at the VM first: its uplink network, and whether it has a SECOPS-SCOPE chain at all. None means
+  # a fresh VM (Docker restarted), where containers that came back by themselves run with no firewall.
+  # (iptables exits 1 for a missing chain; anything else, such as a held xtables lock, is a failed read.)
+  probe=$(printf '%s\n' "$VM_UPLINK_SH" "$ipt -S SECOPS-SCOPE >/dev/null 2>&1; echo \"secstack-chain-rc=\$?.\"" "true" | vm_sh)
+  up=$(printf '%s\n' "$probe" | uplink_nets)
+  # Unread, the VM may have restarted (no rules at all) or not (the previous ones): the messages say both.
+  [ -n "$up" ] || { c_err "couldn't read the Docker VM's own network: scope apply failed before anything was changed (the firewall rules in force are the previous ones, or none if Docker restarted since the last apply: then pentest-net and hexstrike-net are not scope-limited)"; return 1; }
+  case "$probe" in
+    *secstack-chain-rc=0.*) ;;
+    *secstack-chain-rc=1.*) fresh=1 ;;
+    *) c_err "couldn't read the firewall in the Docker VM: scope apply failed before anything was changed (the firewall rules in force are the previous ones, or none if Docker restarted since the last apply: then pentest-net and hexstrike-net are not scope-limited)"; return 1 ;;
+  esac
+  scope_validate "$up" >&2 || { c_err "scope.cidrs invalid; not applied"; return 1; }
+  cidrs=$(scope_cidrs | tr '\n' ' ')
+  R=(); while IFS= read -r spec; do R[${#R[@]}]=$spec; done <<EOF
+$(scope_rules "$mode" "$up" "$cidrs")
+EOF
+  total=${#R[@]}
+  one=$(scope_input "$PENTEST_BR"); two=$(scope_input "$HEXSTRIKE_BR")
+  # Fail closed. Phase 1: keep the VM's own addresses unreachable (INPUT, both bridges) and FORWARD's jump to
+  # DOCKER-USER first, put a guard rule blocking each bridge first in DOCKER-USER, switch bridge netfilter on
+  # and IPv6 off on the bridges, rebuild the chain (its final REJECT before any allow rule). Phase 2: hook the
+  # chain in for each bridge and remove the guards last. If any step fails (set -e), the guards stay and
+  # traffic stays blocked, never open. The secstack-* markers say how far it got.
+  p1=$(
+    echo "set -e"
+    echo "[ \"\$($ipt -S INPUT | sed -n 2p)\" = \"-A INPUT $one\" ] && [ \"\$($ipt -S INPUT | sed -n 3p)\" = \"-A INPUT $two\" ] || { $ipt -I INPUT 1 $two; $ipt -I INPUT 1 $one; }"
+    echo "[ \"\$($ipt -S FORWARD | sed -n 2p)\" = \"-A FORWARD $SCOPE_FORWARD\" ] || $ipt -I FORWARD 1 $SCOPE_FORWARD"
+    echo "$ipt -I DOCKER-USER 1 $(scope_guard "$PENTEST_BR")"
+    echo "echo secstack-guard-pentest"
+    echo "$ipt -I DOCKER-USER 2 $(scope_guard "$HEXSTRIKE_BR")"
+    echo "echo secstack-guard-in"
+    # Traffic inside a bridge (the lab rules, the bridge rules) reaches iptables only with bridge netfilter.
+    echo "modprobe br_netfilter 2>/dev/null || true"
+    echo "sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null"
+    echo "[ \"\$(sysctl -n net.bridge.bridge-nf-call-iptables)\" = 1 ]"
+    # The bridges carry no IPv6: with it off on them, IPv6 from a container reaches neither the VM nor beyond.
+    echo "if sysctl -n net.ipv6.conf.all.disable_ipv6 >/dev/null 2>&1; then"
+    for b in $SCOPE_BRIDGES; do
+      echo "  sysctl -w net.ipv6.conf.$b.disable_ipv6=1 >/dev/null; [ \"\$(sysctl -n net.ipv6.conf.$b.disable_ipv6)\" = 1 ]"
+    done
+    echo "fi"
+    echo "$ipt -N SECOPS-SCOPE 2>/dev/null || $ipt -F SECOPS-SCOPE"
+    echo "$ipt -A SECOPS-SCOPE ${R[$((total - 1))]}"
+    while [ "$n" -lt $((total - 1)) ]; do echo "$ipt -I SECOPS-SCOPE $((n + 1)) ${R[$n]}"; n=$((n + 1)); done
+    echo "echo secstack-chain-built"
+  )
+  p2=$(
+    echo "set -e"
+    for b in $SCOPE_BRIDGES; do echo "while $ipt -D DOCKER-USER $(scope_hook "$b") 2>/dev/null; do :; done"; done
+    echo "$ipt -I DOCKER-USER 3 $(scope_hook "$PENTEST_BR")"
+    echo "$ipt -I DOCKER-USER 4 $(scope_hook "$HEXSTRIKE_BR")"
+    for b in $SCOPE_BRIDGES; do echo "while $ipt -D DOCKER-USER $(scope_guard "$b") 2>/dev/null; do :; done"; done
+    echo "echo secstack-applied"
+    # Narrowing also drops tracked connections (the rules above already stop them leaving the scope).
+    if [ "$flush" = flush ]; then
+      echo "if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $PENTEST_SUBNET >/dev/null 2>&1 || true; conntrack -D -s $HEXSTRIKE_SUBNET >/dev/null 2>&1 || true; else echo secstack-no-conntrack; fi"
+    fi
+    echo "true"
+  )
+  if [ $fresh = 1 ]; then
+    out=$(printf '%s\n' "$p1" | vm_sh 2>&1); rc=$?
+    # A fresh VM: stop what came back by itself while the guards block it (or nothing could be applied).
+    pentest_quarantine
+    if [ $rc -eq 0 ]; then out2=$(printf '%s\n' "$p2" | vm_sh 2>&1); rc=$?; out="$out
+$out2"; fi
+  else
+    out=$(printf '%s\n%s\n' "$p1" "$p2" | vm_sh 2>&1); rc=$?
+  fi
+  if [ $rc -ne 0 ]; then
+    local unguarded="scope apply failed, and its guard rules aren't first in DOCKER-USER (something else changed the firewall meanwhile, or it couldn't be read): pentest-net and hexstrike-net egress may be open until an apply succeeds (run: secstack scope apply)"
+    case "$out" in
+      *secstack-applied*) c_err "scope apply: the rules were written but the Docker VM reported an error; check: secstack scope show" ;;
+      # "stays blocked" only after the guards are read back in place
+      *secstack-guard-in*)
+         if scope_guards_first $SCOPE_BRIDGES; then c_err "scope apply failed; pentest-net and hexstrike-net traffic stays blocked until an apply succeeds"
+         else c_err "$unguarded"; fi ;;
+      *secstack-guard-pentest*)
+         if ! scope_guards_first "$PENTEST_BR"; then c_err "$unguarded"
+         elif [ $fresh = 1 ]; then c_err "scope apply failed; pentest-net traffic stays blocked until an apply succeeds, and hexstrike-net has no scope firewall yet (the Docker VM restarted)"
+         else c_err "scope apply failed; pentest-net traffic stays blocked until an apply succeeds (hexstrike-net keeps its previous rules)"; fi ;;
+      # Before the guards only the INPUT and FORWARD rules (protective, never opening) can have changed.
+      *) if [ $fresh = 1 ]; then c_err "scope apply failed before any guard was in: the Docker VM restarted and has no scope firewall yet, so pentest-net and hexstrike-net are not scope-limited until an apply succeeds"
+         else c_err "scope apply failed before the scope rules changed: the previous ones are still in force"; fi
+         st=$(scope_status 2>&1) || printf '%s\n' "$st" | sed 's/^/    /' >&2 ;;
+    esac
+    printf '%s\n' "$out" | grep -v '^secstack-' | tail -n 3 | sed 's/^/    /' >&2
+    return 1
+  fi
+  if [ "$mode" = install ]; then ( umask 077; echo install > "$SCOPE_MODE_FILE" ); fi
+  # Read the rules back: a step that failed without stopping the script (a removal loop cut short by
+  # a held xtables lock, say) must not be reported as success.
+  if ! st=$(scope_status); then
+    c_err "scope apply: the firewall in the Docker VM isn't the one just written; run 'secstack scope apply' again:"
+    printf '%s\n' "$st" | sed 's/^/    /' >&2; return 1
+  fi
+  case "$out" in *secstack-no-conntrack*) c_warn "no conntrack in the Docker VM: open connections weren't flushed (the rules still stop them leaving the scope)" >&2 ;; esac
+  pentest_no_restart
+  c_ok "scope enforced on $PENTEST_NET and $HEXSTRIKE_NET [$mode]: $cidrs"
+  [ "$mode" = install ] && c_warn "install mode: public 80/443 is open from $PENTEST_NET and $HEXSTRIKE_NET. Run 'secstack scope strict' when done." >&2
+  return 0
+}
+# scope_status: prints what's wrong (one line each) and fails unless the firewall in the Docker VM is
+# exactly what scope_apply writes for scope.cidrs and the saved mode: SECOPS-SCOPE rule for rule, its hooks
+# first in DOCKER-USER, FORWARD's jump to DOCKER-USER first, the INPUT rules first, no guard left, bridge
+# netfilter on and IPv6 off on both bridges (when the VM has IPv6).
+scope_status(){
+  local mode out up b; mode=$(cat "$SCOPE_MODE_FILE" 2>/dev/null || echo strict)
+  case "$mode" in strict|install) ;; *) echo "scope.mode is neither strict nor install: $mode"; return 1 ;; esac
+  alpine_pinned 2>/dev/null || { echo "the firewall wasn't read: ALPINE_IMAGE (upstream/images.lock) must be pinned by digest"; return 1; }
+  out=$(printf '%s\n' "$VM_UPLINK_SH" "echo ==; iptables -w 10 -S FORWARD | sed -n 2p" \
+    "echo ==; iptables -w 10 -S DOCKER-USER" "echo ==; iptables -w 10 -S SECOPS-SCOPE" \
+    "echo ==; iptables -w 10 -S INPUT | sed -n 2,3p" "echo ==; sysctl -n net.bridge.bridge-nf-call-iptables" \
+    "echo ==; if sysctl -n net.ipv6.conf.all.disable_ipv6 >/dev/null 2>&1; then for b in $SCOPE_BRIDGES; do echo \"\$b=\$(sysctl -n net.ipv6.conf.\$b.disable_ipv6 2>/dev/null)\"; done; else echo noipv6; fi" \
+    "true" | vm_sh 2>/dev/null) \
+    || { echo "couldn't read the firewall in the Docker VM"; return 1; }
+  up=$(printf '%s\n' "$out" | uplink_nets)
+  [ -n "$up" ] || { echo "couldn't read the Docker VM's own network"; return 1; }
+  printf '%s\n' "$out" | python3 -c '
+import sys
+want = ["-A SECOPS-SCOPE " + r for r in sys.argv[1].splitlines()]
+mode, fwd, bridges = sys.argv[2], "-A FORWARD " + sys.argv[3], sys.argv[7].split()
+hooks, guards, inputs = (["-A %s %s" % (c, r) for r in a.splitlines()]
+                         for c, a in (("DOCKER-USER", sys.argv[4]), ("DOCKER-USER", sys.argv[5]), ("INPUT", sys.argv[6])))
+sec = [[]]
+for line in sys.stdin.read().splitlines():
+    if line == "==":
+        sec.append([])
+    else:
+        sec[-1].append(line.rstrip())
+sec += [[] for _ in range(8 - len(sec))]
+first_fwd, user, chain, first_in, brnf, v6 = sec[1][:1] or [""], sec[2], sec[3], sec[4], sec[5][:1] or [""], sec[6]
+problems = []
+if first_fwd[0] != fwd:
+    problems.append("FORWARD does not start with the jump to DOCKER-USER (first rule: %s): bridge traffic can skip the scope firewall"
+                    % (first_fwd[0][11:] or "none"))
+user_rules = [l for l in user if l.startswith("-A DOCKER-USER ")]
+missing = [b for h, b in zip(hooks, bridges) if h not in user_rules]
+for b in missing:
+    problems.append("no jump from DOCKER-USER into SECOPS-SCOPE for " + b)
+if not missing and user_rules[:len(hooks)] != hooks:
+    # Exactly the hooks first, in order: a rule between them, or a hook twice (pushing the other one down),
+    # meets the traffic of that bridge before SECOPS-SCOPE does. Name the first foreign rule above the last hook.
+    upto = user_rules[:max(user_rules.index(h) for h in hooks)]
+    other = next((l for l in upto if l not in hooks), None)
+    problems.append("bridge traffic meets another DOCKER-USER rule before SECOPS-SCOPE: " + other[15:] if other else
+                    "DOCKER-USER does not start with one jump into SECOPS-SCOPE per bridge, in order (first rules: %s)"
+                    % " | ".join(l[15:] for l in user_rules[:len(hooks) + 1]))
+for g, b in zip(guards, bridges):
+    if g in user_rules:
+        problems.append("a guard rule left by a failed apply blocks all of " + b)
+got = [l for l in chain if l.startswith("-A SECOPS-SCOPE ")]
+if not chain:
+    problems.append("the SECOPS-SCOPE chain is missing")
+elif got != want:
+    if mode != "install" and "-A SECOPS-SCOPE -p tcp -m multiport --dports 80,443 -j RETURN" in got:
+        problems.append("public 80/443 is open although the mode is " + mode)
+    missing = [l for l in want if l not in got]
+    extra = [l for l in got if l not in want]
+    problems += ["missing rule: " + l[16:] for l in missing] + ["unexpected rule: " + l[16:] for l in extra]
+    if not missing and not extra:
+        problems.append("the SECOPS-SCOPE rules are out of order or repeated")
+if first_in != inputs:
+    problems.append("new connections from the bridges can reach the Docker VM itself (INPUT rules missing or not first)")
+if brnf[0].strip() != "1":
+    problems.append("bridge netfilter is off (net.bridge.bridge-nf-call-iptables is not 1): traffic inside the bridges skips the firewall")
+if v6 != ["noipv6"]:
+    on = dict(l.split("=", 1) for l in v6 if "=" in l)
+    bad = [b for b in bridges if on.get(b) != "1"]
+    if bad:
+        problems.append("IPv6 is on for %s (disable_ipv6 is not 1): IPv6 from there reaches the Docker VM" % ", ".join(bad))
+for p in problems:
+    print(p)
+sys.exit(1 if problems else 0)
+' "$(scope_rules "$mode" "$up" "$(scope_cidrs | tr '\n' ' ')")" "$mode" "$SCOPE_FORWARD" \
+    "$(for b in $SCOPE_BRIDGES; do scope_hook "$b"; done)" "$(for b in $SCOPE_BRIDGES; do scope_guard "$b"; done)" \
+    "$(for b in $SCOPE_BRIDGES; do scope_input "$b"; done)" "$SCOPE_BRIDGES"
+}
+scope_test(){
+  docker_up || return 1; net_check || return 1
+  local tgt hdi net out all=""
+  tgt=$(scope_cidrs | grep '/32$' | head -1 | cut -d/ -f1)
+  # host.docker.internal: the address the container resolves; failing that, .254 of the VM's uplink network.
+  hdi=$(vm_uplink_nets | python3 -c 'import ipaddress, sys
+n = sys.stdin.read().split()
+print(ipaddress.ip_network(n[0]).network_address + 254 if n else "192.168.65.254")')
+  for net in "$PENTEST_NET" "$HEXSTRIKE_NET"; do
+    # The targets travel in the environment (not on the docker command line, where ps would show them).
+    out=$(T="$tgt" H="$hdi" X="$HEXSTRIKE_IP" docker run --rm --network "$net" -e T -e H -e X "$ALPINE_IMAGE" sh -c '
+      if [ -n "$T" ]; then
+        if nc -zw3 "$T" 443 2>/dev/null || nc -zw3 "$T" 80 2>/dev/null; then echo "IN-SCOPE   $T reachable"; else echo "IN-SCOPE   $T no answer on 80/443 (host may be down)"; fi
+      fi
+      if nc -zw4 1.1.1.1 443 2>/dev/null; then echo "OUT-SCOPE  1.1.1.1:443 REACHABLE (leak)"; else echo "OUT-SCOPE  1.1.1.1:443 blocked"; fi
+      if nc -zw4 192.168.1.1 80 2>/dev/null; then echo "OUT-SCOPE  192.168.1.1:80 REACHABLE (leak)"; else echo "OUT-SCOPE  192.168.1.1:80 blocked"; fi
+      set -- $(getent hosts host.docker.internal 2>/dev/null); a=${1:-$H}
+      if nc -zw4 "$a" 11434 2>/dev/null; then echo "OUT-SCOPE  host.docker.internal $a:11434 REACHABLE (leak)"; else echo "OUT-SCOPE  host.docker.internal $a:11434 blocked"; fi
+      if nc -zw4 "$X" 8888 2>/dev/null; then echo "BRIDGE     hexstrike $X:8888 REACHABLE (leak)"; else echo "BRIDGE     hexstrike $X:8888 blocked"; fi
+      nslookup example.com >/dev/null 2>&1 && echo "DNS        resolves (Docker DNS; names can still leave through it)" || echo "DNS        not resolving"
+    ') || { c_err "scope test container on $net failed"; return 1; }
+    all="$all$(printf '%s\n' "$out" | sed "s/^/$net  /")
+"
+  done
+  printf '%s' "$all"
+  case "$all" in *"(leak)"*) c_bad "scope test found a leak"; return 1 ;; esac
+  return 0
+}
+scope_cmd(){
+  local prev
+  case "${1:-show}" in
+    show)    echo "mode: $(cat "$SCOPE_MODE_FILE" 2>/dev/null || echo strict)"; echo "in scope:"; scope_cidrs | sed 's/^/  /'
+             if docker info >/dev/null 2>&1; then
+               # The rules match the bridges by name: a network made some other way (pentagi makes a plain
+               # pentest-net when it's missing) gets none of them, however well the rules read back.
+               if ! net_check; then c_warn "the scope firewall doesn't cover that network (see above)"
+               elif out=$(scope_status); then c_ok "firewall rules in the Docker VM match scope.cidrs"
+               else c_warn "firewall in the Docker VM doesn't match (run: secstack scope apply):"; printf '%s\n' "$out" | sed 's/^/    /'; fi
+             fi ;;
+    add)     [ -n "${2:-}" ] || { echo "usage: secstack scope add CIDR [note]"; return 1; }
+             local net note up="" res
+             # Fixed reserved ranges first (no Docker needed), then the Docker VM's own uplink network.
+             for res in fixed vm; do
+               if [ "$res" = vm ]; then
+                 docker_up || return 1
+                 up=$(vm_uplink_nets); [ -n "$up" ] || { c_bad "couldn't read the Docker VM's own network; scope.cidrs unchanged"; return 1; }
+               fi
+               net=$(python3 -c '
+import ipaddress, sys
+try:
+    n = ipaddress.ip_network(sys.argv[1], strict=False)
+except ValueError:
+    sys.exit(1)
+if n.version != 4 or n.prefixlen < 16 or any(n.overlaps(ipaddress.ip_network(r)) for r in sys.argv[2].split()):
+    sys.exit(1)
+print(n)' "$2" "$(reserved_nets "$up" | tr '\n' ' ')" 2>/dev/null) \
+                 || { c_bad "not an IPv4 CIDR of /16 or narrower outside the reserved ranges ($(reserved_nets "$up" | tr '\n' ' ')): $2"; return 1; }
+             done
+             note=$(printf '%s' "${3:-added $(date +%F)}" | LC_ALL=C tr -cd ' -~')   # printable ASCII only
+             printf '%s    # %s\n' "$net" "$note" >> "$SCOPE_FILE"; chmod 600 "$SCOPE_FILE"; scope_apply ;;
+    rm)      [ -n "${2:-}" ] || { echo "usage: secstack scope rm CIDR"; return 1; }
+             # Remove exactly the entries equal to this network, reading lines the way scope_cidrs does.
+             python3 - "$SCOPE_FILE" "$2" <<'PY' || return 1
+import ipaddress, os, sys
+path, arg = sys.argv[1], sys.argv[2]
+try:
+    target = ipaddress.ip_network(arg, strict=False)
+except ValueError:
+    print(f"not a CIDR: {arg}"); sys.exit(1)
+keep, removed = [], 0
+with open(path, errors="replace") as f:
+    for line in f:
+        tok = line.split("#")[0].strip()
+        try:
+            if tok and ipaddress.ip_network(tok, strict=False) == target:
+                removed += 1
+                continue
+        except ValueError:
+            pass
+        keep.append(line)
+if not removed:
+    print(f"{target} is not in scope.cidrs"); sys.exit(1)
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.writelines(keep)
+os.replace(tmp, path)
+print(f"removed {target}")
+PY
+             scope_apply "" flush ;;
+    strict)  prev=$(cat "$SCOPE_MODE_FILE" 2>/dev/null || echo strict)
+             if [ "$prev" = install ]; then scope_apply strict flush; else scope_apply strict; fi ;;
+    install) scope_apply install ;;
+    apply)   scope_apply ;;
+    test)    scope_test ;;
+    off)     docker info >/dev/null 2>&1 || { c_bad "Docker is not running"; return 1; }
+             if for b in $SCOPE_BRIDGES; do echo "while iptables -w 10 -D DOCKER-USER $(scope_hook "$b") 2>/dev/null; do :; done"; done | vm_sh >/dev/null; then
+               c_warn "scope enforcement removed: pentest-net and hexstrike-net have open egress until the next prep/apply"
+             else c_bad "couldn't remove the scope hook"; return 1; fi ;;
+    *)       echo "usage: secstack scope [show|add CIDR [note]|rm CIDR|strict|install|apply|test|off]"; return 1 ;;
+  esac
+}
+
+# ---------- MCP layer (hexstrike Kali API on hexstrike-net) ----------
+# HexStrike's API runs commands as root in its container, and anything that reaches its port can send any
+# Host header it likes, so the API requires a token (header X-Secstack-Token, checked by
+# configs/hexstrike-kali/hexstrike_entry.py). Every new container gets a new token, so a captured one dies
+# with its container; MCP clients (mcp/hexstrike-client/) read the file again when it changes. The token
+# never goes on a command line, into a shell variable or onto stdout: python3 makes it and writes it to
+# $HEX_TOKEN_FILE and to the container's --env-file; the container is labeled with its fingerprint.
+HEX_TOKEN_FILE="$SECOPS/env/hexstrike-token"
+FIVEIRE_DIR="$HOME/Library/Application Support/5ire"
+# hexstrike_token ENV_FILE: write a new token to $HEX_TOKEN_FILE (64 hex, 600, replaced atomically) and
+# HEXSTRIKE_TOKEN=<token> to ENV_FILE, a new 600 file: if anything is already there (a planted symlink
+# included) this fails instead of writing through it. Prints the token's fingerprint.
+hexstrike_token(){
+  [ -L "$HEX_TOKEN_FILE" ] && { c_err "$HEX_TOKEN_FILE is a symlink; refusing to use it"; return 1; }
+  python3 -c 'import hashlib, os, secrets, sys, tempfile
+path, envf = sys.argv[1], sys.argv[2]
+tok = secrets.token_hex(32)
+try:
+    with os.fdopen(os.open(envf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w") as f:
+        f.write("HEXSTRIKE_TOKEN=%s\n" % tok)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".hexstrike-token.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(tok + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+except OSError as e:
+    sys.exit("%s: %s" % (e.filename, e.strerror))
+print(hashlib.sha256(tok.encode()).hexdigest()[:16])' "$HEX_TOKEN_FILE" "${1:-}"
+}
+# hexstrike_token_id: the fingerprint of the token in $HEX_TOKEN_FILE; nothing if it is missing, malformed
+# or a symlink.
+hexstrike_token_id(){
+  python3 -c 'import hashlib, os, re, sys
+try:
+    with os.fdopen(os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW), "rb") as f:
+        t = f.readline(256).strip()
+except OSError:
+    sys.exit(0)
+if re.fullmatch(rb"[0-9a-f]{64}", t):
+    print(hashlib.sha256(t).hexdigest()[:16])' "$HEX_TOKEN_FILE" 2>/dev/null
+}
+# hexstrike_stale_entries: warn about MCP entries that run hexstrike_mcp.py without the token wrapper (written
+# before it existed): HexStrike refuses them (HTTP 401). Claude Desktop reads its config at every launch, and
+# `claude off` then `claude on` replace such an entry (the stash too, before it is used). 5ire (pinned
+# 12c6a08, legacy-data-migrator.ts) imports mcp.json into its own database once, on its first launch,
+# records that in Stories/legacy-data-migrator.store and never reads or rewrites the file again: the file
+# counts only until then. After that 5ire's servers are edited in 5ire > Tools, which this can't see.
+hexstrike_stale_entries(){
+  local kind five="$FIVEIRE_DIR/mcp.json"
+  [ -e "$FIVEIRE_DIR/Stories/legacy-data-migrator.store" ] && five=""
+  for kind in $(python3 -c 'import json, sys
+def stale(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return False
+    s = d.get("mcpServers", d) if isinstance(d, dict) else None
+    e = s.get("hexstrike-ai") if isinstance(s, dict) else None
+    if not isinstance(e, dict):
+        return False
+    a = e.get("args")
+    words = " ".join(str(x) for x in [e.get("command")] + (a if isinstance(a, list) else [a]))
+    return "hexstrike-env/bin/python3" in words or ("hexstrike_mcp.py" in words and "hexstrike_client.py" not in words)
+for tag, path in zip(("claude", "5ire"), sys.argv[1:]):
+    if path and stale(path):
+        print(tag)' "$CLAUDE_CFG" "$five" 2>/dev/null); do
+    case "$kind" in
+      claude) c_warn "Claude Desktop's hexstrike-ai MCP entry runs hexstrike_mcp.py without the token wrapper, so HexStrike refuses it (HTTP 401). Fix it: secstack claude off && secstack claude on, then restart Claude Desktop" ;;
+      5ire)   c_warn "$five runs hexstrike_mcp.py without the token wrapper (HexStrike refuses it), and 5ire imports that file on its first launch: before opening 5ire, replace its hexstrike-ai entry with the one in $CFG/generated/5ire-mcp.json" ;;
+    esac
+  done
+}
+hexstrike_start(){
+  local tid envf="$RUN/hexstrike.env" rc code
+  docker_up || return 1; scope_apply >/dev/null || return 1
+  docker image inspect hexstrike-kali >/dev/null 2>&1 || { c_bad "image hexstrike-kali missing: ./setup.sh --only images"; return 1; }
+  [ -L "$HEX_TOKEN_FILE" ] && { c_err "$HEX_TOKEN_FILE is a symlink; refusing to use it"; return 1; }
+  if docker ps --format '{{.Names}}' | grep -x hexstrike >/dev/null; then
+    # Kept only if its label is the fingerprint of the token in the file (no valid token there: replaced).
+    tid=$(hexstrike_token_id)
+    if [ "$(docker inspect hexstrike --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' | tr -d ' ')" != "$HEXSTRIKE_NET" ]; then
+      c_warn "hexstrike was on another network; restarting it on $HEXSTRIKE_NET"
+    elif [ -z "$tid" ] || [ "$(docker inspect hexstrike --format '{{index .Config.Labels "secstack.token-id"}}' 2>/dev/null)" != "$tid" ]; then
+      c_warn "hexstrike was started without the current API token; restarting it"
+    else
+      chmod 600 "$HEX_TOKEN_FILE"; c_ok "hexstrike already running (API token required)"; return 0
+    fi
+  fi
+  docker rm -f hexstrike >/dev/null 2>&1   # a running or stopped one would block the name
+  # No data mount: HexStrike (pinned commit) keeps its files in /tmp inside the container, and a
+  # writable host folder would let anything that controls HexStrike write onto the Mac.
+  # A new container, a new token: written to $HEX_TOKEN_FILE and the env file, which docker reads.
+  rm -f "$envf"   # left by an interrupted start; hexstrike_token refuses to write through anything there
+  tid=$(hexstrike_token "$envf") || { rm -f "$envf"; c_bad "couldn't write a new HexStrike API token"; return 1; }
+  docker run -d --rm --name hexstrike --network "$HEXSTRIKE_NET" --ip "$HEXSTRIKE_IP" \
+    -p 127.0.0.1:8888:8888 --cpus="$HEX_CPUS" --memory="${HEX_MEM_GB}g" --pids-limit=1024 \
+    --env-file "$envf" --label "secstack.token-id=$tid" \
+    hexstrike-kali:latest >/dev/null
+  rc=$?; rm -f "$envf"   # docker read it client-side; the token lives on in the container only
+  [ $rc -eq 0 ] || { c_bad "hexstrike failed to start"; return 1; }
+  # Upstream /health takes seconds (a 1 s CPU sample, a `which` per missing tool): up to 10 s per try, and
+  # the server gets a minute to come up.
+  local t0=$SECONDS health=0
+  for _ in $(seq 1 30); do
+    curl -fsS --noproxy '*' -m 10 http://127.0.0.1:8888/health >/dev/null 2>&1 && { health=1; break; }
+    [ $((SECONDS - t0)) -lt 60 ] || break
+    sleep 2
+  done
+  # Fail closed, whether /health answered or not: an image built before the token check would answer this
+  # request without a token, and one that doesn't answer at all can't be checked.
+  code=$(curl -s --noproxy '*' -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/api/secstack-auth-check 2>/dev/null)
+  if [ "$code" != 401 ]; then
+    docker rm -f hexstrike >/dev/null 2>&1
+    case "$code" in
+      ""|000) c_bad "hexstrike didn't answer within a minute, so its API token check couldn't be confirmed: stopped it. Try again: secstack mcp on (if it keeps failing: ./setup.sh --only images)" ;;
+      *) c_bad "hexstrike answered a request without its API token (HTTP $code): the hexstrike-kali image predates the token check. Stopped it; rebuild: ./setup.sh --only images" ;;
+    esac
+    return 1
+  fi
+  if [ $health = 1 ]; then c_ok "hexstrike up on 127.0.0.1:8888 (scope-restricted, API token required)"
+  else c_warn "hexstrike requires its API token, but /health isn't answering yet (docker logs hexstrike)"; fi
+  hexstrike_stale_entries
+  return 0
+}
+hexstrike_stop(){
+  rm -f "$RUN/hexstrike.env"   # left behind only if a start was interrupted
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -x hexstrike >/dev/null && docker stop hexstrike >/dev/null && c_ok "hexstrike stopped" || true
+}
+
+MCP_STASH="$CFG/mcp-servers.stash.json"
+claude_toggle(){ # $1 = on|off. Claude Desktop ignores "disabled", so entries are moved in/out of the config.
+  [ -f "$CLAUDE_CFG" ] || { c_warn "no Claude Desktop config"; return 0; }
+  if python3 - "$CLAUDE_CFG" "$MCP_STASH" "$1" "$REPO_DIR/configs/claude-desktop/mcp-servers.json" "$GH" "$SECOPS" "$HOME" <<'PY'
+import json, os, sys, tempfile
+cfg, stash, mode, tmpl, gh, secops, home = sys.argv[1:8]
+NAMES = ("hexstrike-ai", "kali-tools", "MCP_DOCKER")
+def subst(x):
+    if isinstance(x, str):
+        return x.replace("__SECOPS__", secops).replace("__GH__", gh).replace("__HOME__", home)
+    if isinstance(x, list):
+        return [subst(i) for i in x]
+    if isinstance(x, dict):
+        return {k: subst(v) for k, v in x.items()}
+    return x
+def current(entries):
+    # An entry from before the HexStrike API token ran hexstrike_mcp.py directly; the API now refuses
+    # it, so it is replaced with the template's entry (through mcp/hexstrike-client), wherever it is.
+    e = entries.get("hexstrike-ai")
+    if isinstance(e, dict) and "hexstrike_client.py" not in json.dumps(e):
+        entries["hexstrike-ai"] = subst(json.load(open(tmpl)))["hexstrike-ai"]
+def write(path, data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+d = json.load(open(cfg)); servers = d.setdefault("mcpServers", {})
+saved = json.load(open(stash)) if os.path.exists(stash) else {}
+if not isinstance(saved, dict) or not isinstance(servers, dict):
+    sys.exit("unexpected JSON structure")
+if mode == "off":
+    for k in NAMES:
+        if k in servers:
+            s = servers.pop(k); s.pop("disabled", None); saved[k] = s
+    current(saved)
+    write(stash, saved)
+else:
+    current(saved)
+    for k in NAMES:
+        if k in saved:
+            servers[k] = saved[k]
+        elif k in servers:
+            servers[k].pop("disabled", None)
+    current(servers)
+write(cfg, d)
+print("present in config:", [k for k in NAMES if k in servers])
+PY
+  then c_ok "Claude Desktop MCP entries: $1"
+  else c_bad "couldn't update the Claude Desktop config (left unchanged)"; return 1; fi
+}
+
+# ---------- local vulnerable lab (pentest-net and hexstrike-net only; UIs on 127.0.0.2 only with --ui) ----------
+# The lab serves XSS by design and agents plant payloads in it. Ollama trusts every page on
+# http://127.0.0.1:* and http://localhost:*, so --ui publishes the lab on 127.0.0.2 instead, an origin
+# Ollama doesn't trust (macOS needs the alias first: sudo ifconfig lo0 alias 127.0.0.2 up).
+LAB_UI_IP=127.0.0.2
+lab_mode(){ case "$#:${1:-}" in 0:) echo noui ;; 1:--ui) echo ui ;; *) return 1 ;; esac; }   # [--ui] -> ui|noui
+lab_ready(){ # ui|noui: --ui needs the 127.0.0.2 alias on lo0. Checked before anything changes.
+  [ "$1" = ui ] || return 0
+  ifconfig lo0 2>/dev/null | grep -F "inet $LAB_UI_IP " >/dev/null && return 0
+  c_err "lab --ui publishes on $LAB_UI_IP (Ollama trusts any page on 127.0.0.1), and lo0 has no $LAB_UI_IP yet. Add it (lasts until reboot):"
+  echo "  sudo ifconfig lo0 alias $LAB_UI_IP up" >&2
+  echo "  or now and at every boot (asks before sudo): $REPO_DIR/setup.sh --only loopback" >&2
+  return 1
+}
+# (grep reads the whole list: with pipefail, `grep -q` exiting early could fail docker's write, and the pipe)
+lab_exists(){ docker ps -a --format '{{.Names}}' | grep -x "$1" >/dev/null; }
+lab_create(){ # $1 = ui|noui. A container that isn't exactly what this creates (on pentest-net and hexstrike-net
+  # only, at its fixed addresses, with this mode's published ports, from the pinned image, NET_RAW dropped)
+  # is recreated.
+  local ui="$1" name ip iph hport cport mem plat image pub want have
+  for name in lab-dvwa lab-juice; do
+    case "$name" in
+      lab-dvwa) ip=172.30.0.10; iph=172.30.1.10; hport=8081; cport=80; mem=768m; plat="--platform linux/amd64"
+                image=$(img DVWA_IMAGE vulnerables/web-dvwa) ;;
+      *)        ip=172.30.0.11; iph=172.30.1.11; hport=8082; cport=3000; mem=512m; plat=""
+                image=$(img JUICE_IMAGE bkimminich/juice-shop) ;;
+    esac
+    pub=""; [ "$ui" = ui ] && pub="-p $LAB_UI_IP:$hport:$cport"
+    if lab_exists "$name"; then
+      want="$HEXSTRIKE_NET=$iph $PENTEST_NET=$ip |${pub:+$LAB_UI_IP:$hport }|$image|"
+      have=$(docker inspect "$name" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{if $v.IPAMConfig}}{{$v.IPAMConfig.IPv4Address}}{{end}} {{end}}|{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}|{{.Config.Image}}|{{.HostConfig.CapDrop}}' 2>/dev/null)
+      case "$have" in "$want"*NET_RAW*) continue ;; esac
+      docker rm -f "$name" >/dev/null 2>&1
+    fi
+    # NET_RAW dropped: root in a lab container could otherwise forge another address on either bridge.
+    # shellcheck disable=SC2086
+    docker create --name "$name" --network "$PENTEST_NET" --ip "$ip" $pub --cap-drop NET_RAW $plat \
+        --memory="$mem" --cpus=1 --restart=no "$image" >/dev/null \
+      && docker network connect --ip "$iph" "$HEXSTRIKE_NET" "$name" >/dev/null \
+      || { docker rm -f "$name" >/dev/null 2>&1; return 1; }
+  done
+}
+dvwa_init(){ # from a throwaway container on pentest-net, so the lab needs no published port
+  docker image inspect hexstrike-kali >/dev/null 2>&1 \
+    || { c_warn "DVWA database not initialized (needs the hexstrike-kali image: ./setup.sh --only images)"; return 0; }
+  docker run --rm --network "$PENTEST_NET" --entrypoint sh hexstrike-kali -c '
+    u=http://172.30.0.10/setup.php; j=/tmp/jar
+    for i in $(seq 1 45); do curl -fsS -m 3 "$u" >/dev/null 2>&1 && break; sleep 2; done
+    t=$(curl -s -c $j "$u" | grep -oE "user_token. value=.[0-9a-f]+" | grep -oE "[0-9a-f]{32}" | head -1)
+    [ -n "$t" ] && curl -fsS -b $j -c $j --data "create_db=Create+%2F+Reset+Database&user_token=$t" "$u" >/dev/null' \
+    && c_ok "DVWA database initialized" || c_warn "DVWA database init failed (secstack lab up --ui, open setup.php, Create / Reset Database)"
+}
+lab_up(){ # [--ui]
+  local ui
+  ui=$(lab_mode "$@") || { echo "usage: secstack lab up [--ui]"; return 1; }
+  lab_ready "$ui" || return 1
+  docker_up || return 1; scope_apply >/dev/null || return 1
+  lab_create "$ui" && docker start lab-dvwa lab-juice >/dev/null || { c_bad "lab failed to start (try: secstack lab reset)"; return 1; }
+  dvwa_init
+  if [ "$ui" = ui ]; then
+    c_ok "lab up: DVWA 172.30.0.10 (http://$LAB_UI_IP:8081, admin/password) | Juice Shop 172.30.0.11:3000 (http://$LAB_UI_IP:8082) | from HexStrike: 172.30.1.10, 172.30.1.11"
+    c_warn "lab pages may hold payloads the agents planted; browse them in a separate browser profile, not next to pentagi/ARTEX sessions"
+  else
+    c_ok "lab up on $PENTEST_NET and $HEXSTRIKE_NET only: DVWA 172.30.0.10 (admin/password) | Juice Shop 172.30.0.11:3000 | from HexStrike: 172.30.1.10, 172.30.1.11 (browse them: secstack lab up --ui)"
+  fi
+}
+lab_stop(){ docker info >/dev/null 2>&1 || return 0; docker stop lab-dvwa lab-juice >/dev/null 2>&1 && c_ok "lab stopped" || true; }
+lab_reset(){ # [--ui]: the arguments (and the --ui alias) are checked before anything is removed
+  local ui
+  ui=$(lab_mode "$@") || { echo "usage: secstack lab reset [--ui]"; return 1; }
+  lab_ready "$ui" || return 1
+  docker rm -f lab-dvwa lab-juice >/dev/null 2>&1; lab_up "$@"
+}
+
+# ---------- self-hosted search for pentagi ----------
+searxng_up(){
+  docker network inspect pentagi-network >/dev/null 2>&1 || return 0
+  docker ps --format '{{.Names}}' | grep -x searxng >/dev/null && return 0
+  # The secret reaches docker through a 600 env file, so it never appears on a command line or in `bash -x`.
+  local ef="$SECOPS/env/searxng.env" old="$SECOPS/env/searxng-secret"
+  if [ ! -s "$ef" ]; then
+    ( umask 077
+      if [ -s "$old" ]; then printf 'SEARXNG_SECRET=%s\n' "$(tr -dc '0-9a-f' < "$old")" > "$ef"
+      else printf 'SEARXNG_SECRET=%s\n' "$(openssl rand -hex 32)" > "$ef"; fi )
+  fi
+  docker run -d --rm --name searxng --network pentagi-network --memory=384m --cpus=1 \
+    --env-file "$ef" -e SEARXNG_BASE_URL=http://searxng:8080/ \
+    -v "$CFG/searxng/settings.yml:/etc/searxng/settings.yml:ro" "$(img SEARXNG_IMAGE searxng/searxng)" >/dev/null \
+    && c_ok "SearXNG up (pentagi-network only: http://searxng:8080)" || c_warn "SearXNG failed to start"
+}
+searxng_stop(){ docker ps --format '{{.Names}}' 2>/dev/null | grep -x searxng >/dev/null && docker stop searxng >/dev/null && c_ok "SearXNG stopped" || true; }
+
+# ---------- frameworks ----------
+# Compose runs only the pinned files, named explicitly: an untracked compose.yaml or compose.override.yml, or
+# COMPOSE_FILE in the environment or a .env, can't swap the stack. pentagi also runs without the .env keys
+# the audit checks in its environment, so a shell export can't override what the audit read.
+artex_compose(){ (cd "$GH/ARTEX" && docker compose -f docker-compose.yml "$@"); }
+pentagi_compose(){
+  local ov=""
+  [ -f "$GH/pentagi/docker-compose.override.yml" ] && ov="-f docker-compose.override.yml"
+  # shellcheck disable=SC2086
+  (cd "$GH/pentagi" && env -u DOCKER_INSIDE -u DOCKER_NET_ADMIN -u DOCKER_NETWORK -u DOCKER_IMAGE_SELECTION_MODE \
+    -u PENTAGI_LISTEN_IP -u DOCKER_PUBLIC_IP docker compose -f docker-compose.yml $ov "$@")
+}
+# pentagi publishes two ports per flow from its Kali terminals on DOCKER_PUBLIC_IP. Ollama trusts any page on
+# http://127.0.0.1:*, and root in a terminal can serve one there, so they go on 127.0.0.2 (an lo0 alias).
+PENTAGI_PUBLIC_IP=127.0.0.2
+# pentagi_env_check: "OK ..." or "BAD ..." for each security setting in pentagi's .env, read the way docker
+# compose reads it (scripts/render-env.py --get: export prefixes, spacing, KEY: value, the last one wins).
+pentagi_env_check(){
+  local f="$GH/pentagi/.env" k v
+  [ -f "$f" ] || { echo "BAD $f is missing (./setup.sh --only upstream)"; return 0; }
+  for k in DOCKER_INSIDE DOCKER_NET_ADMIN DOCKER_NETWORK DOCKER_IMAGE_SELECTION_MODE PENTAGI_LISTEN_IP DOCKER_PUBLIC_IP; do
+    if ! v=$(python3 "$REPO_DIR/scripts/render-env.py" --get "$k" --file "$f" 2>/dev/null); then
+      echo "BAD couldn't read $k from $f (scripts/render-env.py --get)"; continue
+    fi
+    case "$k=$v" in
+      DOCKER_INSIDE=|DOCKER_INSIDE=false) echo "OK pentagi's terminals don't get the Docker socket" ;;
+      DOCKER_INSIDE=*) echo "BAD pentagi .env DOCKER_INSIDE is not false: its terminals could leave the scope through the Docker socket" ;;
+      DOCKER_NET_ADMIN=false) echo "OK pentagi's terminals don't get NET_ADMIN" ;;
+      DOCKER_NET_ADMIN=*) echo "BAD pentagi .env DOCKER_NET_ADMIN is not false: its terminals get NET_ADMIN (./setup.sh --only upstream)" ;;
+      "DOCKER_NETWORK=$PENTEST_NET") echo "OK pentagi spawns Kali terminals on $PENTEST_NET" ;;
+      DOCKER_NETWORK=*) echo "BAD pentagi .env DOCKER_NETWORK is not $PENTEST_NET" ;;
+      DOCKER_IMAGE_SELECTION_MODE=fixed) echo "OK pentagi uses the pinned Kali image only" ;;
+      DOCKER_IMAGE_SELECTION_MODE=*) echo "BAD pentagi .env DOCKER_IMAGE_SELECTION_MODE is not fixed" ;;
+      PENTAGI_LISTEN_IP=127.0.0.1) echo "OK pentagi listens on 127.0.0.1" ;;
+      PENTAGI_LISTEN_IP=*) echo "BAD pentagi .env PENTAGI_LISTEN_IP is not 127.0.0.1" ;;
+      "DOCKER_PUBLIC_IP=$PENTAGI_PUBLIC_IP") echo "OK pentagi publishes its terminals' ports on $PENTAGI_PUBLIC_IP only" ;;
+      *) echo "BAD pentagi .env DOCKER_PUBLIC_IP is not $PENTAGI_PUBLIC_IP: a page served from a terminal's port could drive Ollama, or other machines could reach the terminals (./setup.sh --only upstream)" ;;
+    esac
+  done
+}
+# pentagi_ready: what `secstack pentagi` checks before it changes anything (ARTEX is stopped after this): a safe
+# .env, the override that keeps pentagi from restarting with Docker, and the 127.0.0.2 alias for terminal ports.
+pentagi_ready(){
+  local p
+  p=$(pentagi_env_check | sed -n 's/^BAD //p')
+  if [ -n "$p" ]; then
+    printf '%s\n' "$p" | while IFS= read -r l; do c_err "$l"; done
+    c_err "refusing to start pentagi; fix $GH/pentagi/.env (./setup.sh --only upstream re-applies secstack's settings)"
+    return 1
+  fi
+  # Byte for byte the override secstack ships (as bootstrap installs it): any other file there may not keep
+  # pentagi from restarting with Docker, before the scope firewall.
+  cmp -s "$REPO_DIR/upstream/pentagi/docker-compose.override.yml" "$GH/pentagi/docker-compose.override.yml" \
+    || { c_err "refusing to start pentagi: $GH/pentagi/docker-compose.override.yml (restart: no) is missing or isn't the one secstack ships (./setup.sh --only upstream puts it back)"; return 1; }
+  ifconfig lo0 2>/dev/null | grep -F "inet $PENTAGI_PUBLIC_IP " >/dev/null && return 0
+  c_err "pentagi publishes its Kali terminals' ports on $PENTAGI_PUBLIC_IP (Ollama trusts any page on 127.0.0.1), and lo0 has no $PENTAGI_PUBLIC_IP yet. Add it (lasts until reboot):"
+  echo "  sudo ifconfig lo0 alias $PENTAGI_PUBLIC_IP up" >&2
+  echo "  or now and at every boot (asks before sudo): $REPO_DIR/setup.sh --only loopback" >&2
+  return 1
+}
+artex_up(){ # [--build]: rebuild ARTEX's images (after its pin moved); otherwise built only if missing
+  local build=""
+  case "${1:-}" in --build) build=--build ;; "") ;; *) echo "usage: secstack artex [--build]" >&2; return 1 ;; esac
+  docker_up || return 1
+  # shellcheck disable=SC2086
+  artex_compose up -d $build >"$LOG/artex-up.log" 2>&1 \
+    && c_ok "ARTEX on http://127.0.0.1:8787 (proxy 127.0.0.1:8788)" || { c_bad "ARTEX failed (see $LOG/artex-up.log)"; return 1; }
+}
+artex_down(){ docker info >/dev/null 2>&1 && artex_compose stop >/dev/null 2>&1 && c_ok "ARTEX stopped" || true; }
+pentagi_up(){
+  pentagi_ready || return 1
+  docker_up || return 1
+  scope_apply >/dev/null || return 1
+  restart_guard_start      # before compose: terminals pentagi brings back lose their restart policy at once
+  pentagi_compose up -d pentagi pgvector scraper >"$LOG/pentagi-up.log" 2>&1 \
+    && c_ok "pentagi on https://127.0.0.1:8443 (scraper 127.0.0.1:9443; Kali terminals on $PENTEST_NET, their ports on $PENTAGI_PUBLIC_IP)" \
+    || { c_bad "pentagi failed (see $LOG/pentagi-up.log)"
+         # The guard stays while a pentagi runs (an earlier run's, or one this run got as far as starting).
+         docker ps --format '{{.Names}}' 2>/dev/null | grep -x pentagi >/dev/null || restart_guard_stop
+         return 1; }
+  pentest_no_restart       # one sweep after start-up too, in case the guard subscribed late
+  searxng_up
+}
+pentagi_down(){
+  local c
+  docker info >/dev/null 2>&1 || { restart_guard_stop; return 0; }
+  searxng_stop
+  # pentagi first, so it can't create a terminal meanwhile; the restart guard keeps running until the end.
+  # Kali terminals are not part of compose: stop (not remove) them so evidence survives for `secstack report`.
+  pentagi_compose stop >/dev/null 2>&1 && c_ok "pentagi stopped" || true
+  for c in $(docker ps --format '{{.Names}}' | grep '^pentagi-terminal-' || true); do docker stop "$c" >/dev/null; done
+  pentest_no_restart       # last: none of them may come back with Docker before the firewall
+  restart_guard_stop
+}
+
+# ---------- local inference ----------
+OLLAMA_ENV="OLLAMA_HOST=127.0.0.1:11434 OLLAMA_CONTEXT_LENGTH=$CTX OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_NUM_PARALLEL=$PARALLEL OLLAMA_KEEP_ALIVE=10m OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=$KV_TYPE"
+EMBED_PID="$RUN/ollama-embed.pid"; EMBED_LOG="$LOG/ollama-embed.log"
+# The ollama CLI always talks to the chat instance here, whatever OLLAMA_HOST the caller's shell has.
+ollama_cli(){ OLLAMA_HOST=127.0.0.1:11434 "$OLLAMA" "$@"; }
+# Where the models live. Ollama.app reads launchd's environment; the :11435 instance, `secstack models` and
+# plan.py read this shell's. The shell's OLLAMA_MODELS wins (llm start copies it to launchd), else launchd's.
+ollama_models_dir(){
+  local d="${OLLAMA_MODELS:-}"
+  [ -n "$d" ] || d=$(launchctl getenv OLLAMA_MODELS 2>/dev/null || true)
+  printf '%s\n' "${d:-$HOME/.ollama/models}"
+}
+# ollama_cors_open PORT: the Ollama on PORT serves an arbitrary website (OLLAMA_ORIGINS=* or similar), which
+# could then pull, replace or delete models. Ollama answers 403 to an origin it doesn't allow.
+ollama_cors_open(){
+  [ "$(curl -s -o /dev/null -m 2 -w '%{http_code}' -H 'Origin: https://secstack-origin-check.invalid' \
+       "http://127.0.0.1:$1/api/version" 2>/dev/null)" = 200 ]
+}
+# ollama_config_diff LOG KEY:VALUE...: what the last "server config" line in LOG gets wrong, one word per line:
+# "nolog" without such a line, the KEY of each setting it lacks, and "ORIGINS" when it allows an origin beyond
+# Ollama's own defaults (loopback http(s); the app, file, tauri and vscode schemes): "*", a website, a browser
+# extension. Nothing when it's all as planned.
+ollama_config_diff(){
+  local line need
+  line=$(grep "server config" "$1" 2>/dev/null | tail -n 1); shift
+  [ -n "$line" ] || { echo nolog; return 0; }
+  for need in "$@"; do
+    case "$line" in *"$need "*|*"$need]"*) ;; *) echo "${need%%:*}" ;; esac
+  done
+  printf '%s\n' "$line" | python3 -c '
+import re, sys
+line = sys.stdin.read()
+i = line.find("OLLAMA_ORIGINS:[")
+# An origin may hold "]" ([::1]), so the list ends at the "]" before the next map key (Ollama env names all
+# have an "_", URL schemes never do) or before the "]" that ends the map. Unreadable: treated as foreign.
+m = re.match(r"(.*?)\](?= [A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]*:|\]\"?\s*$)", line[i + 16:], re.S) if i >= 0 else None
+if i >= 0 and not m:
+    sys.exit(1)
+APP = ("app", "file", "tauri", "vscode-webview", "vscode-file")
+for o in (m.group(1).split() if m else []):
+    scheme, sep, rest = o.partition("://")
+    host = rest.split("/")[0]
+    host = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
+    if not sep or (scheme in ("http", "https") and host not in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")) \
+            or (scheme not in ("http", "https") and scheme not in APP):
+        sys.exit(1)' || echo ORIGINS
+}
+ollama_config_ok(){ [ -z "$(ollama_config_diff "$@")" ]; }
+# ollama_settings_hint DIFF: Ollama.app's own Settings override what launchd passes when it starts its server;
+# restarting can't fix that, so name the setting.
+ollama_settings_hint(){
+  local k msg=""
+  for k in $1; do
+    case "$k" in
+      nolog) msg="$msg; ~/.ollama/logs/server.log shows no server config (another ollama serve on :11434?)" ;;
+      OLLAMA_HOST) msg="$msg; Expose Ollama to the network is on (it listens beyond 127.0.0.1)" ;;
+      OLLAMA_CONTEXT_LENGTH) msg="$msg; Context length is set (the plan uses $((CTX / 1024))K)" ;;
+      OLLAMA_MODELS) msg="$msg; Model location is set (the plan uses $(ollama_models_dir))" ;;
+      ORIGINS) msg="$msg; browser requests from other origins are allowed (websites or extensions could use the API)" ;;
+      *) msg="$msg; $k differs from the plan" ;;
+    esac
+  done
+  c_bad "Ollama started without the planned settings, so it was stopped. In Ollama.app > Settings:${msg#;}. Change it, then: secstack llm start"
+}
+# pid_cmd_is PIDFILE REGEX: the pid in PIDFILE is alive and its command line matches REGEX. A pid file can
+# outlive its process (a crash, a reboot) and then name an unrelated one, which must not be killed.
+pid_cmd_is(){
+  local pid; pid=$(cat "$1" 2>/dev/null) || return 1
+  case "$pid" in ""|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o command= 2>/dev/null | grep -E "$2" >/dev/null
+}
+ollama_start(){
+  local kv models diff started=1 log="$HOME/.ollama/logs/server.log"
+  for kv in $OLLAMA_ENV; do launchctl setenv "${kv%%=*}" "${kv#*=}"; done
+  launchctl unsetenv OLLAMA_ORIGINS 2>/dev/null   # extra origins let websites use the API
+  models=$(ollama_models_dir); export OLLAMA_MODELS="$models"
+  launchctl setenv OLLAMA_MODELS "$models"
+  set -- "OLLAMA_HOST:http://127.0.0.1:11434" "OLLAMA_CONTEXT_LENGTH:$CTX" "OLLAMA_NUM_PARALLEL:$PARALLEL" \
+    "OLLAMA_KV_CACHE_TYPE:$KV_TYPE" "OLLAMA_MODELS:$models"
+  if curl -fsS -m 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+    if ollama_cors_open 11434 || ! ollama_config_ok "$log" "$@"; then
+      c_warn "Ollama running without the planned settings; restarting it"; ollama_stop >/dev/null
+    else started=0; fi
+  fi
+  curl -fsS -m 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1 || open -a Ollama
+  for _ in $(seq 1 20); do
+    if curl -fsS -m 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+      if ollama_cors_open 11434; then
+        # Started (or restarted) here, yet open to any website: Ollama.app's own browser setting overrides
+        # launchd's. Stop it and name the setting; if it still answers, it isn't Ollama.app's server.
+        if [ $started = 1 ]; then
+          ollama_stop >/dev/null
+          curl -fsS -m 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1 || { ollama_settings_hint ORIGINS; return 1; }
+        fi
+        c_bad "Ollama on 127.0.0.1:11434 accepts requests from any website (OLLAMA_ORIGINS); stop that server, then: secstack llm start"
+        return 1
+      fi
+      # A server started here got launchd's settings unless Ollama.app's Settings override them: check once,
+      # and stop and say which setting rather than restart in a loop.
+      if [ $started = 1 ]; then
+        diff=$(ollama_config_diff "$log" "$@")
+        if [ -n "$diff" ]; then ollama_stop >/dev/null; ollama_settings_hint "$diff"; return 1; fi
+      fi
+      c_ok "Ollama on 127.0.0.1:11434 ($((CTX / 1024))K ctx, 1 model resident, $PARALLEL parallel)"; return 0
+    fi
+    sleep 1
+  done
+  c_bad "Ollama not responding"; return 1
+}
+ollama_stop(){
+  local m
+  if curl -fsS -m 2 http://127.0.0.1:11434/api/ps >/dev/null 2>&1; then
+    for m in $(curl -s http://127.0.0.1:11434/api/ps | python3 -c 'import json,sys;[print(m["name"]) for m in json.load(sys.stdin).get("models",[])]'); do ollama_cli stop "$m" >/dev/null 2>&1; done
+  fi
+  osascript -e 'quit app "Ollama"' >/dev/null 2>&1
+  pkill -f "Ollama.app/Contents/MacOS/Ollama" 2>/dev/null
+  # Only the app's own server (its bundled binary): other ollama or llama.cpp servers are not ours to stop.
+  sleep 1; pkill -f "Ollama.app/Contents/Resources/ollama serve" 2>/dev/null
+  for _ in 1 2 3 4 5; do
+    curl -fsS -m 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1 || { c_ok "Ollama stopped (models unloaded)"; return 0; }
+    sleep 1
+  done
+  c_warn "something still answers on 127.0.0.1:11434 (an ollama serve that isn't Ollama.app's)"
+}
+embed_start(){
+  local models; models=$(ollama_models_dir)
+  if curl -fsS -m 2 "http://127.0.0.1:$EMBED_PORT/api/version" >/dev/null 2>&1; then
+    if ! ollama_cors_open "$EMBED_PORT" \
+       && ollama_config_ok "$EMBED_LOG" "OLLAMA_HOST:http://127.0.0.1:$EMBED_PORT" "OLLAMA_MODELS:$models"; then
+      return 0
+    fi
+    pid_cmd_is "$EMBED_PID" '(^|/)ollama serve$' || {
+      c_bad "something other than secstack's embedding server answers on 127.0.0.1:$EMBED_PORT; stop it, then: secstack llm start"
+      return 1; }
+    c_warn "embedding server running without the planned settings; restarting it"; embed_stop
+  fi
+  # Same models as Ollama.app; OLLAMA_ORIGINS from this shell is dropped, so no website can use it either.
+  nohup env -u OLLAMA_ORIGINS OLLAMA_HOST="127.0.0.1:$EMBED_PORT" OLLAMA_MODELS="$models" OLLAMA_MAX_LOADED_MODELS=1 \
+    OLLAMA_NUM_PARALLEL=4 OLLAMA_KEEP_ALIVE=30m OLLAMA_CONTEXT_LENGTH=8192 "$OLLAMA" serve > "$EMBED_LOG" 2>&1 &
+  echo $! > "$EMBED_PID"
+  for _ in $(seq 1 15); do curl -fsS -m 2 "http://127.0.0.1:$EMBED_PORT/api/version" >/dev/null 2>&1 && { c_ok "embeddings on 127.0.0.1:$EMBED_PORT (nomic-embed-text only)"; return 0; }; sleep 1; done
+  c_bad "embedding server not responding (see $EMBED_LOG)"; return 1
+}
+embed_stop(){
+  local pid
+  if pid_cmd_is "$EMBED_PID" '(^|/)ollama serve$'; then
+    pid=$(cat "$EMBED_PID"); kill "$pid" 2>/dev/null
+    for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  fi
+  rm -f "$EMBED_PID"
+}
+llm_start(){ ollama_start && embed_start; }
+llm_stop(){
+  ollama_stop; embed_stop
+  curl -fsS -m 2 "http://127.0.0.1:$EMBED_PORT/api/version" >/dev/null 2>&1 \
+    && c_warn "something still answers on 127.0.0.1:$EMBED_PORT (not the embedding server secstack started)"
+  return 0
+}
+docker_stop(){
+  docker desktop stop >/dev/null 2>&1 || osascript -e 'quit app id "com.docker.docker"' >/dev/null 2>&1
+  for _ in $(seq 1 30); do pgrep -f com.docker.backend >/dev/null || { c_ok "Docker Desktop stopped (VM memory released)"; return 0; }; sleep 2; done
+  c_warn "Docker backend still running; force-stopping"; pkill -f com.docker.backend; sleep 2
+  pgrep -f com.docker.backend >/dev/null && c_bad "Docker backend did not stop" || c_ok "Docker Desktop stopped"
+}
+
+# ---------- models ----------
+models(){
+  hdr "Local models (budget: $MAX_CHAT_MODELS chat models, ${MODEL_BUDGET_GB} GB; plan: $(models_list | tr '\n' ' '))"
+  if curl -fsS -m 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    curl -s http://127.0.0.1:11434/api/tags | python3 -c 'import json,sys
+for m in sorted(json.load(sys.stdin)["models"], key=lambda x: x["name"]):
+    print("  ollama  %-48s %5.1f GB" % (m["name"], m["size"]/1e9))'
+  else echo "  (Ollama not running; listing blob store only)"; fi
+  local ol extra total dir
+  dir=$(ollama_models_dir)   # the folder Ollama.app uses, not just this shell's OLLAMA_MODELS
+  ol=$(du -skH "$dir" 2>/dev/null | cut -f1)      # -H: the folder may be a symlink to another volume
+  extra=$(du -skH "${SECSTACK_MODELS_DIR:-$HOME/models/gguf}" 2>/dev/null | cut -f1)
+  total=$(( (${ol:-0} + ${extra:-0}) / 1048576 ))
+  if [ "$total" -le "$MODEL_BUDGET_GB" ]; then c_ok "model storage ${total} GB of ${MODEL_BUDGET_GB} GB ($dir)"
+  else c_bad "model storage ${total} GB exceeds ${MODEL_BUDGET_GB} GB ($dir)"; return 1; fi
+}
+# model_drift: "drift ALIAS" for each installed alias whose manifest digest differs from the one install-models
+# recorded, "missing ALIAS" for a recorded alias Ollama no longer has, or one "skip REASON" line when the
+# digests can't be compared.
+model_drift(){
+  local tags
+  tags=$(curl -fsS -m 3 http://127.0.0.1:11434/api/tags 2>/dev/null) || { echo "skip Ollama is not running"; return 0; }
+  printf '%s\n' "$tags" | python3 -c '
+import json, sys
+try:
+    tags = {m.get("name"): m.get("digest") for m in json.load(sys.stdin).get("models", [])}
+except (ValueError, AttributeError, TypeError):
+    sys.exit(print("skip Ollama returned an unreadable model list"))
+try:
+    rec = json.load(open(sys.argv[1])).get("installed")
+except (OSError, ValueError, AttributeError):
+    rec = None
+if not isinstance(rec, dict) or not rec:
+    sys.exit(print("skip no recorded digests (scripts/plan.py install-models records them)"))
+for alias, info in rec.items():
+    # As plan.py _listed_digests: an exact match, else the single entry equal up to case (Ollama lists a model
+    # in the case it was pulled with; APFS finds it either way).
+    full = alias if ":" in alias.rsplit("/", 1)[-1] else alias + ":latest"
+    keys = [full] if full in tags else [k for k in tags if isinstance(k, str) and ":" in k.rsplit("/", 1)[-1]
+                                        and k.lower() == full.lower()]
+    have = tags[keys[0]] if len(keys) == 1 else None
+    want = info.get("digest") if isinstance(info, dict) else None
+    if not have:
+        print("missing", alias)
+    elif want and have != want:
+        print("drift", alias)
+' "$CFG/models.selected.json"
+}
+
+# ---------- flows: report / watch / CVE verification / templates / bench ----------
+flow_py(){ [ -x "$PYH" ] || { c_bad "python env missing: $PYH (./setup.sh --only upstream)"; return 1; }; "$PYH" "$FLOWPY" "$@"; }
+watcher_alive(){ kill -0 "$1" 2>/dev/null && ps -p "$1" -o command= 2>/dev/null | grep 'secops-flow.py watch' >/dev/null; }
+watch_start(){ # flow [--down] [--stall N] ...
+  local id="${1:?flow id}" pf pid; shift
+  case "$id" in *[!0-9]*) c_bad "flow id must be a number"; return 1 ;; esac
+  [ -x "$PYH" ] || { c_bad "python env missing: $PYH (./setup.sh --only upstream)"; return 1; }
+  pf="$RUN/watch-$id.pid"
+  if [ -f "$pf" ] && watcher_alive "$(cat "$pf")"; then c_ok "already watching flow $id"; return 0; fi
+  nohup "$PYH" "$FLOWPY" watch "$id" "$@" > "$LOG/watch-flow$id.out" 2>&1 &
+  pid=$!
+  echo "$pid" > "$pf"
+  nohup caffeinate -i -w "$pid" >/dev/null 2>&1 &   # keep the Mac awake only while the watcher runs
+  c_ok "watching flow $id (pid $pid, log $LOG/watch-flow$id.log); Mac kept awake until it ends"
+}
+watch_stop(){
+  local f pid
+  for f in "$RUN"/watch-${1:-*}.pid; do
+    [ -f "$f" ] || continue
+    pid=$(cat "$f"); watcher_alive "$pid" && kill "$pid" 2>/dev/null; rm -f "$f"
+  done
+  c_ok "watcher(s) stopped"
+}
+
+# ---------- audit ----------
+# audit_listeners: "OK|BAD <process> <address>:<port>" for each TCP listener on a security port, or "NONE".
+# netstat sees every user's sockets; lsof, run as you, sees only your own processes, so it only names them.
+# Fails if netstat can't be read.
+audit_listeners(){
+  local ns
+  ns=$(netstat -anv -p tcp 2>/dev/null) && [ -n "$ns" ] || return 1
+  printf '%s\n' "$ns" | python3 -c '
+import sys
+ports, names, found = set(sys.argv[1].split()), {}, False
+for l in sys.argv[2].splitlines()[1:]:
+    f = l.split()
+    if len(f) >= 9:
+        host, _, port = f[8].rpartition(":")
+        names.setdefault((host.strip("[]"), port), f[0])
+for l in sys.stdin:
+    f = l.split()
+    if len(f) < 6 or not f[0].startswith("tcp") or f[5] != "LISTEN":
+        continue
+    host, _, port = f[3].rpartition(".")
+    if port in ports:
+        found = True
+        loop = host.startswith("127.") or host == "::1" or host.endswith("%lo0")
+        print("%s %s %s:%s%s" % ("OK" if loop else "BAD", names.get((host, port), "(another user)"), host, port,
+                                 "" if loop else "  (NOT loopback)"))
+if not found:
+    print("NONE")
+' "$SEC_PORTS" "$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null)"
+}
+# audit_containers: "OK|WARN|BAD|SKIP ..." lines from `docker inspect` of every container: published ports of
+# the running ones; and, in any state, the ones on pentest-net, sharing a pentest-net network namespace or named
+# like secstack's: networks, privileges, Docker socket or VM mounts, restart policies. Also pentagi's policy.
+audit_containers(){
+  local ids
+  ids=$(docker ps -aq 2>/dev/null) || { echo "SKIP containers (docker ps failed)"; return 0; }
+  # docker inspect goes straight into python, never into a shell variable: its JSON holds the containers'
+  # environments (HexStrike's API token, pentagi's .env values), which `bash -x` would print.
+  # shellcheck disable=SC2086
+  { if [ -z "$ids" ]; then echo "[]"; else docker inspect $ids 2>/dev/null || true; fi; } | python3 -c '
+import json, re, sys
+net, hnet = sys.argv[1], sys.argv[2]
+def want(n):   # the networks each container must be on, and no other: HexStrike alone on its bridge, the lab on both
+    return sorted([hnet] if n == "hexstrike" else [hnet, net] if n in ("lab-dvwa", "lab-juice") else [net])
+try:
+    cs = [c for c in json.loads(sys.stdin.read() or "null") if isinstance(c, dict)]
+except (ValueError, TypeError):
+    sys.exit(print("SKIP containers (docker inspect gave no readable output)"))
+LOOP = ("127.0.0.1", "::1")
+DEFAULT_CAPS = {"CHOWN", "DAC_OVERRIDE", "FSETID", "FOWNER", "MKNOD", "NET_RAW", "SETGID", "SETUID",
+                "SETFCAP", "SETPCAP", "NET_BIND_SERVICE", "SYS_CHROOT", "KILL", "AUDIT_WRITE"}
+SENSITIVE = ("/var/run/docker.sock", "/run/docker.sock", "/run/host-services/docker.proxy.sock", "/var/lib/docker")
+OURS = re.compile(r"(pentagi-terminal-|hexstrike$|lab-)")
+def g(d, *keys):
+    for k in keys:
+        d = d.get(k) if isinstance(d, dict) else None
+    return d
+def name(c):
+    return (c.get("Name") or str(c.get("Id", "?"))[:12]).lstrip("/")
+def nets(c):
+    return sorted(g(c, "NetworkSettings", "Networks") or {})
+running = [c for c in cs if g(c, "State", "Running")]
+pentagi_running = any(name(c) == "pentagi" for c in running)
+pub = []
+for c in running:
+    for port, binds in (g(c, "NetworkSettings", "Ports") or {}).items():
+        for b in binds or []:
+            ip = (b or {}).get("HostIp") or ""
+            where = "%s %s:%s->%s" % (name(c), ip or "*", (b or {}).get("HostPort"), port)
+            if not (ip.startswith("127.") or ip in LOOP):
+                pub.append("BAD container publishing beyond loopback: " + where)
+            elif net in nets(c) and ip != sys.argv[3]:   # Kali terminals, the lab: what they serve is agent-made
+                pub.append("BAD pentest-net container publishing on an origin Ollama trusts (only %s is allowed): %s"
+                           % (sys.argv[3], where))
+for p in pub:
+    print(p)
+if not pub:
+    print("OK every published container port is on loopback (pentest-net ones on %s)" % sys.argv[3])
+members = [c for c in cs if net in nets(c) or hnet in nets(c)]
+def shared(c):
+    mode = g(c, "HostConfig", "NetworkMode") or ""
+    ref = mode.split(":", 1)[1] if mode.startswith("container:") else ""
+    return ref if ref and any(ref == name(m) or str(m.get("Id", "")).startswith(ref) for m in members) else ""
+for c in cs:
+    n, hc, sh = name(c), c.get("HostConfig") or {}, shared(c)
+    if not (net in nets(c) or hnet in nets(c) or sh or OURS.match(n)):
+        continue
+    probs = []
+    if sh:
+        probs.append("shares the network namespace of " + sh)
+    elif nets(c) != want(n):
+        probs.append("on networks: " + (" ".join(nets(c)) or "none"))
+    if hc.get("Privileged"):
+        probs.append("privileged")
+    for k in ("NetworkMode", "PidMode", "IpcMode"):
+        if hc.get(k) == "host":
+            probs.append(k + " host")
+    # pentagi adds SYS_PTRACE to its terminals (worker_spec.go); they do not share the VM process namespace.
+    caps = sorted({str(x).upper().replace("CAP_", "", 1) for x in hc.get("CapAdd") or []} - DEFAULT_CAPS
+                  - ({"SYS_PTRACE"} if n.startswith("pentagi-terminal-") else set()))
+    if caps:
+        probs.append("added capabilities " + ",".join(caps))
+    for o in hc.get("SecurityOpt") or []:
+        if str(o).replace(":", "=", 1) in ("seccomp=unconfined", "apparmor=unconfined", "label=disable", "systempaths=unconfined"):
+            probs.append("security option " + str(o))
+    if hc.get("Devices"):
+        probs.append("host devices")
+    if hc.get("DeviceCgroupRules"):   # e.g. "b *:* rwm" with MKNOD: raw access to the VM disk
+        probs.append("device cgroup rules " + ",".join(str(r) for r in hc["DeviceCgroupRules"]))
+    for m in c.get("Mounts") or []:
+        src, dst = m.get("Source") or "", m.get("Destination") or ""
+        s = src.rstrip("/") + "/"
+        if "docker.sock" in src + " " + dst or (src and m.get("Type") == "bind" and (
+                any((p + "/").startswith(s) for p in SENSITIVE) or s.startswith("/var/lib/docker/"))):
+            probs.append("mounts %s at %s (the Docker socket or the VM Docker data)" % (src, dst))
+    state = "running" if g(c, "State", "Running") else (g(c, "State", "Status") or "stopped")
+    if probs:
+        print("BAD %s (%s): %s" % (n, state, "; ".join(probs)))
+    else:
+        print("OK %s on %s only, unprivileged (%s)" % (n, " and ".join(want(n)), state))
+    pol = g(c, "HostConfig", "RestartPolicy", "Name") or ""
+    if pol not in ("", "no"):
+        print(("WARN %s has restart policy %s while pentagi runs" if pentagi_running else
+               "BAD %s has restart policy %s: it would start with Docker, before the scope firewall") % (n, pol)
+              + " (secstack stop clears it)")
+for c in cs:
+    if name(c) == "pentagi":
+        if (g(c, "HostConfig", "RestartPolicy", "Name") or "") in ("", "no"):
+            print("OK pentagi doesn\x27t restart on its own (the scope firewall is re-applied first)")
+        else:
+            print("BAD pentagi restarts with Docker, before the scope firewall is back: ./setup.sh --only upstream, then secstack pentagi")
+' "$PENTEST_NET" "$HEXSTRIKE_NET" "$PENTAGI_PUBLIC_IP" || echo "SKIP containers (couldn't evaluate docker inspect)"
+}
+# audit_perms: "OK|BAD mode path" for the secret files (600) and their folders (700); a symlink is BAD.
+audit_perms(){
+  python3 -c '
+import os, stat, sys
+for p in sys.argv[1:]:
+    if not os.path.lexists(p):
+        continue
+    st = os.lstat(p)
+    mode = oct(stat.S_IMODE(st.st_mode))[2:]
+    if stat.S_ISLNK(st.st_mode):
+        print("BAD link %s (a symlink: keep secrets in plain files and folders)" % p)
+    elif stat.S_ISDIR(st.st_mode):
+        print(("OK %s %s" if mode == "700" else "BAD %s %s (chmod 700)") % (mode, p))
+    else:
+        print(("OK %s %s" if mode == "600" else "BAD %s %s (chmod 600)") % (mode, p))
+' "$GH/ARTEX/.env" "$GH/pentagi/.env" "$GH"/pentagi/secstack.*.provider.yml "$SECOPS"/env/* "$SECOPS"/env/.[!.]* \
+    "$SECOPS" "$SECOPS/env" "$GH/pentagi" "$GH/ARTEX"
+}
+# _audit_print LINES: shows "OK|WARN|BAD|SKIP text" lines. BAD sets bad=1 and SKIP adds to skipped (the
+# caller's locals): an audit that couldn't check something never reports PASSED.
+_audit_print(){
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      "OK "*) c_ok "${line#OK }" ;;
+      "WARN "*) c_warn "${line#WARN }" ;;
+      "BAD "*) c_bad "${line#BAD }"; bad=1 ;;
+      "SKIP "*) c_warn "not checked: ${line#SKIP }"; skipped="${skipped:+$skipped; }${line#SKIP }" ;;
+      ?*) printf '  %s\n' "$line" ;;
+    esac
+  done <<EOF
+$1
+EOF
+}
+# audit: exit 0 = passed, 1 = found issues, 2 = incomplete (a part couldn't be checked, e.g. Docker or Ollama
+# not running), never "passed" in that case.
+audit(){
+  local bad=0 skipped="" out p a hosts v4 v6 swap_used
+  hdr "Listeners on security ports (must be loopback only)"
+  if out=$(audit_listeners); then
+    if [ "$out" = NONE ]; then c_ok "no security services listening"; else _audit_print "$out"; fi
+  else _audit_print "SKIP listeners (netstat -anv -p tcp failed)"; fi
+  hdr "pentagi .env (read the way docker compose reads it)"
+  _audit_print "$(pentagi_env_check)"
+  if docker info >/dev/null 2>&1; then
+    hdr "Containers"
+    _audit_print "$(audit_containers)"
+    # While pentagi runs it creates Kali terminals with a restart policy; only the guard clears it at once.
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -x pentagi >/dev/null; then
+      if restart_guard_alive; then c_ok "the restart guard clears the restart policy of every new pentest-net container"
+      else c_bad "pentagi runs without secstack's restart guard: its new Kali terminals would start with Docker, before the scope firewall (secstack pentagi starts it)"; bad=1; fi
+    fi
+    hdr "Scope enforcement"
+    # Either network is enough to check: HexStrike runs on hexstrike-net even with pentest-net gone.
+    if docker network inspect "$PENTEST_NET" >/dev/null 2>&1 || docker network inspect "$HEXSTRIKE_NET" >/dev/null 2>&1; then
+      net_check 2>&1 || bad=1
+      if out=$(scope_status); then c_ok "firewall in the Docker VM matches scope.cidrs [$(cat "$SCOPE_MODE_FILE" 2>/dev/null || echo strict)]: $(scope_cidrs | tr '\n' ' ')"
+      else c_bad "firewall in the Docker VM doesn't match (secstack scope apply):"; printf '%s\n' "$out" | sed 's/^/    /'; bad=1; fi
+      [ "$(cat "$SCOPE_MODE_FILE" 2>/dev/null)" = install ] && { c_bad "scope is in install mode (public 80/443 open): secstack scope strict"; bad=1; }
+    else c_warn "$PENTEST_NET and $HEXSTRIKE_NET not created yet"; fi
+    hdr "Docker VM vs plan"
+    if [ -f "$PLANPY" ] && [ -f "$STACK_CONF" ]; then
+      python3 "$PLANPY" docker-check | sed 's/^/  /'; [ "${PIPESTATUS[0]}" -eq 0 ] || c_warn "set Docker Desktop > Settings > Resources to the plan"
+    else c_warn "no stack.conf: run ./setup.sh --only plan to size this Mac"; fi
+  else
+    hdr "Containers and scope enforcement"
+    _audit_print "SKIP Docker is not running (published ports, pentest-net containers, restart policies, scope firewall)"
+  fi
+  hdr "Secrets file permissions (files 600, folders 700)"
+  out=$(audit_perms) || out="SKIP file permissions (python3 failed)"
+  _audit_print "$out"
+  hdr "Models"
+  out=$(model_drift) || out="skip the model digests couldn't be compared"
+  case "$out" in
+    "") c_ok "installed models match the digests install-models recorded" ;;
+    skip\ *) _audit_print "SKIP model digests: ${out#skip }" ;;
+    *) a=$(printf '%s\n' "$out" | sed -n 's/^drift //p' | tr '\n' ' ')
+       [ -z "$a" ] || c_bad "models changed since install-models recorded them: $a(re-check, then scripts/plan.py install-models --force)"
+       a=$(printf '%s\n' "$out" | sed -n 's/^missing //p' | tr '\n' ' ')
+       [ -z "$a" ] || c_bad "recorded models missing from Ollama: $a(scripts/plan.py install-models)"
+       bad=1 ;;
+  esac
+  # Each running instance: a request from a foreign origin must be refused, and its server log must allow no
+  # origin beyond Ollama's defaults (one made-up origin can't stand for a listed website or an extension).
+  for p in 11434 "$EMBED_PORT"; do
+    curl -fsS -m 2 "http://127.0.0.1:$p/api/version" >/dev/null 2>&1 || continue
+    if [ "$p" = 11434 ]; then out="$HOME/.ollama/logs/server.log"; else out="$EMBED_LOG"; fi
+    a=$(ollama_config_diff "$out")
+    if ollama_cors_open "$p" || [ "$a" = ORIGINS ]; then
+      c_bad "Ollama on 127.0.0.1:$p accepts requests from other websites or extensions (OLLAMA_ORIGINS, or Ollama.app's browser setting): secstack llm stop, then secstack llm start"; bad=1
+    elif [ "$a" = nolog ]; then _audit_print "SKIP origins allowed by the Ollama on :$p (no server config in $out)"
+    else c_ok "Ollama on 127.0.0.1:$p refuses requests from other websites and extensions"; fi
+  done
+  hdr "Nothing starts at login, nothing phones home"
+  if launchctl print "gui/$(id -u)/com.ollama.ollama" >/dev/null 2>&1; then
+    c_warn "an Ollama login item is registered (Ollama.app > Settings: turn off launch at login)"
+  else c_ok "no Ollama login item"; fi
+  if [ -d /Applications/5ire.app ] || [ -d "$HOME/Applications/5ire.app" ]; then
+    # Blocked only with both an IPv4 (0.0.0.0) and an IPv6 (::) entry; SECSTACK_HOSTS_FILE is for the tests.
+    hosts="${SECSTACK_HOSTS_FILE:-/etc/hosts}"
+    v4='^[[:space:]]*(0\.0\.0\.0|127\.0\.0\.1)[[:space:]]+([^#]*[[:space:]])?api\.axiom\.co([[:space:]]|$)'
+    v6='^[[:space:]]*(::|::1)[[:space:]]+([^#]*[[:space:]])?api\.axiom\.co([[:space:]]|$)'
+    if grep -iqE "$v4" "$hosts" 2>/dev/null && grep -iqE "$v6" "$hosts" 2>/dev/null; then
+      c_ok "5ire log shipping (api.axiom.co) blocked for IPv4 and IPv6"
+    else c_warn "5ire log shipping not blocked for both IPv4 and IPv6: printf '\\n0.0.0.0 api.axiom.co\\n:: api.axiom.co\\n' | sudo tee -a /etc/hosts"; fi
+  fi
+  hdr "Mutual exclusion"
+  a=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c '^artex' || true); p=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -cx pentagi || true)
+  [ "${a:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ] && { c_bad "ARTEX and pentagi are BOTH running"; bad=1; } || c_ok "ARTEX/pentagi not running together"
+  hdr "Memory budget (${RAM_GB} GB: macOS ~${OS_RESERVE_GB} | Docker VM ${DOCKER_VM_GB} | one model <= ${FENCE_GB})"
+  memory_pressure 2>/dev/null | grep -E "System-wide memory free percentage" | sed 's/^/  /' || true
+  swap_used=$(sysctl -n vm.swapusage 2>/dev/null | sed -E 's/.*used = ([0-9.]+)M.*/\1/')
+  if awk -v s="${swap_used:-0}" 'BEGIN{exit !(s>1024)}'; then c_warn "swap in use: ${swap_used} MB"; else c_ok "swap in use: ${swap_used:-?} MB"; fi
+  if docker info >/dev/null 2>&1; then
+    echo "  Docker VM: $(docker info --format '{{.NCPU}} CPUs, {{.MemTotal}} bytes')"
+    docker stats --no-stream --format '  {{.Name}}: {{.MemUsage}} ({{.CPUPerc}} cpu)' 2>/dev/null
+  else echo "  Docker: not running"; fi
+  if curl -fsS -m 2 http://127.0.0.1:11434/api/ps >/dev/null 2>&1; then
+    curl -s http://127.0.0.1:11434/api/ps | python3 -c 'import json,sys
+ms = json.load(sys.stdin).get("models", [])
+print("  Ollama loaded:", ", ".join("%s %.1f GB" % (m["name"], m.get("size_vram", 0) / 1e9) for m in ms) or "none")'
+  else echo "  Ollama: not running"; fi
+  models | sed -n '$p' || bad=1     # model storage over the budget fails the audit
+  echo
+  if [ $bad -ne 0 ]; then c_bad "AUDIT FOUND ISSUES"; return 1; fi
+  if [ -n "$skipped" ]; then c_warn "AUDIT INCOMPLETE, not checked: $skipped"; return 2; fi
+  c_ok "AUDIT PASSED"
+}
+
+status(){
+  hdr "secstack status"
+  docker info >/dev/null 2>&1 && docker ps --format '  {{.Names}}\t{{.Status}}\t{{.Ports}}' || echo "  Docker: stopped"
+  curl -fsS -m 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1 && echo "  Ollama: running" || echo "  Ollama: stopped"
+  echo "  models: $CHAT_MODEL (primary) | $DEEP_MODEL (deep) | $ALT_MODEL (alt) | embed $EMBED_MODEL"
+  echo "  plan:   $([ -f "$STACK_CONF" ] && echo "$STACK_CONF" || echo "none (48 GB reference defaults)")"
+  echo "  scope: $(cat "$SCOPE_MODE_FILE" 2>/dev/null || echo strict)"
+  for f in "$RUN"/watch-*.pid; do [ -f "$f" ] && watcher_alive "$(cat "$f")" && echo "  watcher: $(basename "$f" .pid)"; done
+  return 0
+}
+
+usage(){ cat <<EOF
+secstack v10: offensive-security workstation control (local abliterated models only)
+ setup
+  ./setup.sh (in the repo)      hardware-aware install: plan, models, images, frameworks, audit
+  secstack plan                 this Mac's hardware, resource plan and model recommendations
+ session
+  secstack prep                 Docker + scope firewall + inference + hexstrike (5ire tools connect)
+  secstack pentagi              start pentagi (stops ARTEX). Refuses an unsafe pentagi/.env, or no
+                                127.0.0.2 on lo0 for its terminals' ports
+                                (./setup.sh --only loopback adds it)
+  secstack artex [--build]      start ARTEX (stops pentagi and the flow watchers);
+                                --build after its pin moved
+  secstack stop                 stop the flow watchers (always), pentagi, ARTEX, hexstrike and the
+                                lab; keep Docker + Ollama up
+  secstack down                 stop everything, unload models, stop Docker + Ollama
+  secstack status | audit       state | listener/container/scope/.env/perms/model/memory checks
+                                (audit exit: 0 passed, 1 issues found, 2 incomplete: something
+                                wasn't checked, e.g. Docker or Ollama down, no recorded model
+                                digests, netstat unreadable)
+ scope (pentest-net and hexstrike-net egress firewall;
+        ARTEX, pentagi itself, its scraper and search are not covered)
+  secstack scope [show]         mode, in-scope CIDRs, and whether the VM's rules match them
+  secstack scope add CIDR [note] | rm CIDR
+                                edit scope and re-apply
+  secstack scope apply          re-apply (after a Docker restart)
+  secstack scope strict|install
+                                install = also allow public 80/443 for package installs (temporary)
+  secstack scope test           prove in-scope reachable, out-of-scope blocked (non-zero on a leak)
+  secstack scope off            remove the hook (open egress) until the next apply
+ lab
+  secstack lab up [--ui] | down | reset [--ui]
+                                DVWA 172.30.0.10 + Juice Shop 172.30.0.11 on pentest-net
+                                (.1.10/.1.11 on hexstrike-net); --ui also publishes them on
+                                127.0.0.2:8081 / :8082
+                                (needs 127.0.0.2 on lo0: ./setup.sh --only loopback)
+ flows
+  secstack report FLOW [--expect vendor[,product]]
+                                export evidence + NVD check of the CVE IDs (first 100)
+  secstack watch FLOW [--down]  background watcher: notify on finish/stall, auto-report
+  secstack watch stop [FLOW]
+  secstack verify-cve FILE... [--expect vendor[,product]]
+  secstack templates [--create-only]
+                                sync configs/flow-templates/*.md into pentagi (pentagi running)
+  secstack providers [--create-only] [--prune]
+                                sync the plan's pentagi providers (pentagi running);
+                                plain = also update existing ones (backup to logs/ first);
+                                --prune = remove dropped ones
+ models / inference
+  secstack models               installed models + storage vs ${MODEL_BUDGET_GB} GB budget
+  secstack bench [MODEL ...]    speed / tool-call / JSON / refusal benchmark
+                                (default: the plan's models)
+  secstack llm start|stop       Ollama (chat :11434, embeddings :11435): loopback only,
+                                planned settings, no website access (OLLAMA_ORIGINS cleared)
+ misc
+  secstack mcp on|off           hexstrike container only
+  secstack claude on|off        optional Claude Desktop MCP entries (needs a Claude restart)
+EOF
+}
+
+case "${1:-}" in
+  prep)    docker_up || exit 1
+           c_ok "Docker engine ready (plan: $DOCKER_VM_CPUS CPU / $DOCKER_VM_GB GB VM)"
+           scope_apply || exit 1; llm_start || exit 1; hexstrike_start || exit 1
+           echo; echo "Ready. Chat: 5ire (model $CHAT_MODEL) with HexStrike + Kali docs + pentagi bridge."
+           echo "       Autonomous: secstack pentagi | secstack artex   Lab: secstack lab up" ;;
+  # Arguments and pentagi's own checks come before anything is stopped, and Docker starts before Ollama (a
+  # container that came back with Docker is stopped before Ollama listens).
+  pentagi) [ $# -eq 1 ] || { echo "usage: secstack pentagi" >&2; exit 1; }
+           pentagi_ready || exit 1; docker_up || exit 1
+           artex_down; llm_start || exit 1; pentagi_up ;;
+  artex)   case "$#:${2:-}" in 1:|2:--build) ;; *) echo "usage: secstack artex [--build]" >&2; exit 1 ;; esac
+           watch_stop >/dev/null   # flow watchers would give up on pentagi and run `secstack down` mid-session
+           docker_up || exit 1; pentagi_down; llm_start || exit 1; artex_up "${2:-}" ;;
+  down)    [ $# -eq 1 ] || { echo "usage: secstack down" >&2; exit 1; }
+           docker info >/dev/null 2>&1 && pentest_no_restart   # nothing on pentest-net comes back with Docker
+           watch_stop >/dev/null; hexstrike_stop; lab_stop; artex_down; pentagi_down; llm_stop; docker_stop ;;
+  stop)    [ $# -eq 1 ] || { echo "usage: secstack stop" >&2; exit 1; }
+           watch_stop >/dev/null
+           docker info >/dev/null 2>&1 || { restart_guard_stop; c_ok "Docker not running (flow watchers stopped)"; exit 0; }
+           pentest_no_restart; hexstrike_stop; lab_stop; artex_down; pentagi_down ;;
+  _restart-guard) restart_guard_run ;;   # started by `secstack pentagi` (restart_guard_start), not by hand
+  version) echo "secstack v10" ;;
+  plan)    python3 "$PLANPY" recommend ;;
+  status)  status ;;
+  audit)   audit ;;
+  scope)   shift; scope_cmd "$@" ;;
+  lab)     case "${2:-}" in
+             up) shift 2; lab_up "$@";;
+             down) [ $# -eq 2 ] || { echo "usage: secstack lab down"; exit 1; }; lab_stop;;
+             reset) shift 2; lab_reset "$@";;
+             *) usage; exit 1;;
+           esac ;;
+  report)  shift; flow_py report "$@" ;;
+  watch)   shift; if [ "${1:-}" = stop ]; then shift; watch_stop "${1:-}"; else watch_start "$@"; fi ;;
+  verify-cve) shift; flow_py verify-cve "$@" ;;
+  templates) shift; flow_py template-sync "$@" ;;
+  providers) shift; flow_py providers-sync "$@" ;;
+  models)  models ;;
+  bench)   shift; OLLAMA_HOST=127.0.0.1:11434 "$SECOPS/bin/bench-run.sh" "$@" ;;   # its ollama CLI calls: this Mac's
+  llm)     case "${2:-}" in start) llm_start;; stop) llm_stop;; *) usage; exit 1;; esac ;;
+  mcp)     case "${2:-}" in on) hexstrike_start;; off) hexstrike_stop;; *) usage; exit 1;; esac ;;
+  claude)  case "${2:-}" in on|off) claude_toggle "$2" && echo "Restart Claude Desktop to apply.";; *) usage; exit 1;; esac ;;
+  ""|-h|--help|help) usage ;;
+  *)       echo "unknown command: $1" >&2; usage; exit 1 ;;
+esac

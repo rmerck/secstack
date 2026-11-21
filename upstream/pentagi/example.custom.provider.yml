@@ -1,0 +1,67 @@
+# Cloud hybrid template (inert until LLM_SERVER_URL / LLM_SERVER_KEY are set in .env).
+# Heavy reasoning roles -> frontier model; high-volume roles -> cheap fast model on the same endpoint.
+# Replace model IDs with ones your endpoint serves (e.g. an OpenRouter or Anthropic-compatible gateway).
+adviser:
+  model: "FRONTIER_MODEL_ID"
+  n: 1
+  max_tokens: 16000
+
+generator:
+  model: "FRONTIER_MODEL_ID"
+  n: 1
+  max_tokens: 16000
+
+refiner:
+  model: "FRONTIER_MODEL_ID"
+  n: 1
+  max_tokens: 16000
+
+primary_agent:
+  model: "FRONTIER_MODEL_ID"
+  n: 1
+  max_tokens: 16000
+
+pentester:
+  model: "FRONTIER_MODEL_ID"
+  n: 1
+  max_tokens: 16000
+
+coder:
+  model: "FRONTIER_MODEL_ID"
+  n: 1
+  max_tokens: 16000
+
+simple:
+  model: "FAST_MODEL_ID"
+  n: 1
+  max_tokens: 8192
+
+simple_json:
+  model: "FAST_MODEL_ID"
+  n: 1
+  max_tokens: 8192
+
+searcher:
+  model: "FAST_MODEL_ID"
+  n: 1
+  max_tokens: 8192
+
+enricher:
+  model: "FAST_MODEL_ID"
+  n: 1
+  max_tokens: 8192
+
+reflector:
+  model: "FAST_MODEL_ID"
+  n: 1
+  max_tokens: 8192
+
+assistant:
+  model: "FAST_MODEL_ID"
+  n: 1
+  max_tokens: 8192
+
+installer:
+  model: "FAST_MODEL_ID"
+  n: 1
+  max_tokens: 8192

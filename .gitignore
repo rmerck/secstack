@@ -1,0 +1,80 @@
+# ---- Never commit: secrets, engagement data, runtime state ----
+# (scripts/check-secrets.sh blocks these too, and anything force-added past this file.)
+.env
+*.env
+.env.*
+.env-*
+.env_*
+*.env.*
+env.*
+.envrc
+!*.env.example
+!env.overrides
+!env.example
+!env.sample
+!env.template
+!env.py
+!env.sh
+!env.js
+!env.ts
+!env.md
+env/
+logs/
+reports/
+run/
+cache/
+hexstrike-data/
+*.bak
+*.pre-repo-*
+OPERATIONS.md
+*-api-token
+*-secret
+*-setup-token
+nvd-api-key
+
+# Keys, credential files, captures and cracked hashes.
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
+*.kdbx
+*.ovpn
+*.pcap
+*.pcapng
+*.har
+*.pot
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+.netrc
+_netrc
+.git-credentials
+.pgpass
+
+# Live scope holds real target addresses. Only the example is tracked.
+**/configs/scope.cidrs
+**/configs/scope.mode
+**/configs/mcp-servers.stash.json
+
+# The per-machine plan lives in $SECOPS, never here (these names guard against a misplaced runtime root).
+**/configs/stack.conf
+**/configs/models.selected.json
+**/configs/generated/
+**/configs/pentagi-providers/
+venv/
+
+# Exported Modelfiles may contain local paths; review before un-ignoring.
+models/exported/*.raw
+models/exported/ollama-list.txt
+
+# Python / OS noise
+__pycache__/
+*.pyc
+.venv/
+*-env/
+.DS_Store
+*.swp
+*~
+.secstack-tmp.*

@@ -1,0 +1,12 @@
+diff --git a/requirements.txt b/requirements.txt
+index 9b96558..b0eb23d 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,5 @@
+ mcp>=1.0.0
+-pydantic>=2.5.3
++pydantic>=2.5.3,<2.12  # mcp 1.12.x (capped by uvicorn pin) breaks on pydantic>=2.12
+ fastapi>=0.104.1
+ uvicorn==0.24.0
+ pyyaml==6.0.1
+\ No newline at end of file

@@ -1,0 +1,6 @@
+# secstack-managed (scripts/bootstrap-upstream.sh); changes here are overwritten.
+# pentagi must not come back by itself after a Docker restart: the scope firewall inside the Docker
+# VM is gone until `secstack pentagi` (or `secstack scope apply`) re-applies it.
+services:
+  pentagi:
+    restart: "no"

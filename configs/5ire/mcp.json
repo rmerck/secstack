@@ -1,0 +1,52 @@
+{
+  "mcpServers": {
+    "hexstrike-ai": {
+      "name": "HexStrike (Kali container)",
+      "description": "Offensive-security tools in the hexstrike-kali container on 127.0.0.1:8888 (API token added by the secstack wrapper). Start it with: secstack prep",
+      "command": "__SECOPS__/venv/bin/python3",
+      "args": [
+        "__SECOPS__/mcp/hexstrike-client/hexstrike_client.py",
+        "__GH__/hexstrike-ai/hexstrike_mcp.py",
+        "--server",
+        "http://127.0.0.1:8888"
+      ],
+      "env": {
+        "SECOPS": "__SECOPS__"
+      },
+      "isActive": true,
+      "approvalPolicy": "always"
+    },
+    "kali-tools": {
+      "name": "Kali tool docs",
+      "description": "Offline search of 823 Kali tool docs (no network, read-only container)",
+      "command": "/Applications/Docker.app/Contents/Resources/bin/docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "--network=none",
+        "--cpus=2",
+        "--memory=512m",
+        "--read-only",
+        "--tmpfs",
+        "/tmp",
+        "kali-tools-mcp-server"
+      ],
+      "isActive": true,
+      "approvalPolicy": "never"
+    },
+    "pentagi-bridge": {
+      "name": "pentagi bridge",
+      "description": "Start, monitor and stop pentagi autonomous flows (default provider from the plan). Needs: secstack pentagi",
+      "command": "__SECOPS__/venv/bin/python3",
+      "args": [
+        "__SECOPS__/mcp/pentagi-bridge/pentagi_mcp.py"
+      ],
+      "env": {
+        "SECOPS": "__SECOPS__"
+      },
+      "isActive": true,
+      "approvalPolicy": "always"
+    }
+  }
+}

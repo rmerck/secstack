@@ -1,0 +1,41 @@
+{
+  "hexstrike-ai": {
+    "command": "__SECOPS__/venv/bin/python3",
+    "args": [
+      "__SECOPS__/mcp/hexstrike-client/hexstrike_client.py",
+      "__GH__/hexstrike-ai/hexstrike_mcp.py",
+      "--server",
+      "http://127.0.0.1:8888"
+    ],
+    "env": {
+      "SECOPS": "__SECOPS__"
+    },
+    "timeout": 300,
+    "alwaysAllow": []
+  },
+  "kali-tools": {
+    "command": "/Applications/Docker.app/Contents/Resources/bin/docker",
+    "args": [
+      "run",
+      "-i",
+      "--rm",
+      "--network=none",
+      "--cpus=2",
+      "--memory=512m",
+      "--read-only",
+      "--tmpfs",
+      "/tmp",
+      "kali-tools-mcp-server"
+    ]
+  },
+  "MCP_DOCKER": {
+    "command": "docker",
+    "args": [
+      "mcp",
+      "gateway",
+      "run",
+      "--profile",
+      "claude_mcp"
+    ]
+  }
+}

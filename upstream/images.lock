@@ -1,0 +1,15 @@
+# Container images used by secstack and pentagi. KEY=reference.
+# repo@sha256:... = pinned (from the reference Mac's pull logs, 2026-11-18/19, i.e. images known to work).
+# A plain tag = not pinned yet. Run scripts/pin-images.sh on a Mac where the stack works to pin every
+# entry to the image it actually runs, then commit this file.
+# build-images.sh pulls only images that are missing (or all with --pull); nothing is silently upgraded.
+# alpine:3 as of 2026-11-08 (multi-arch index digest from Docker Hub). secstack runs it privileged in the
+# Docker VM to program the scope firewall, so it must stay digest-pinned (secstack refuses a tag).
+ALPINE_IMAGE=alpine@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+SEARXNG_IMAGE=searxng/searxng@sha256:5b72d7ef63a3d214c2a690016ecf53a17f1ab7f02dcc4a1de1669837d9340fc9
+DVWA_IMAGE=vulnerables/web-dvwa@sha256:dae203fe11646a86937bf04db0079adef295f426da68a92b40e3b181f337daa7
+JUICE_IMAGE=bkimminich/juice-shop@sha256:adaf6a6ca50f772dff7d2fe56972c659e81a61e0dbbe607c2b39fefd436e6153
+KALI_PENTEST_IMAGE=vxcontrol/kali-linux@sha256:7f803e5be80ec33dcf4228d9702ea1264658b43301e9d6bf3bce6cf8b1077399
+PENTAGI_IMAGE=vxcontrol/pentagi:latest
+PGVECTOR_IMAGE=vxcontrol/pgvector:latest
+SCRAPER_IMAGE=vxcontrol/scraper:latest
