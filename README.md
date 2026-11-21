@@ -90,7 +90,8 @@ ends by itself when Docker stops.
 setup.sh             one-command, resumable installer (--plan, --yes, --models, --from, --only, --help)
 install.sh           links the repo into the runtime root (~/GitHub/.sec-ops), installs the git hooks;
                      --check shows changes first
-bin/                 secstack, secops-flow.py, toolcall-test.py, bench-run.sh, hexstrike-ctl
+bin/                 secstack, secops-flow.py, toolcall-test.py, bench-run.sh, hexstrike-ctl,
+                     secstack-mcp (one short command per MCP server, for 5ire)
 mcp/                 pentagi-bridge (5ire -> pentagi REST API), hexstrike-client (adds HexStrike's API
                      token); stdio MCP servers, loopback only
 models/catalog.json  the model catalog (<= 15); see models/README.md

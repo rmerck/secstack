@@ -69,10 +69,14 @@ cp ~/GitHub/.sec-ops/configs/generated/5ire-mcp.json ~/Library/Application\ Supp
 ```
 
 On a 5ire that has been opened, `mcp.json` no longer counts (5ire imports it once, on its first launch):
-add or edit the three servers in 5ire > Tools using the commands in that file. HexStrike and the
-pentagi bridge run `~/GitHub/.sec-ops/venv/bin/python3` (HexStrike through
-`~/GitHub/.sec-ops/mcp/hexstrike-client/hexstrike_client.py`, which adds its API token), Kali docs runs
-`docker`. Then block the log shipping (the audit wants both lines; leave out one `/etc/hosts` already has):
+add or edit the three servers in 5ire > Tools, one command each: `~/GitHub/.sec-ops/bin/secstack-mcp`
+followed by `hexstrike`, `kali-docs` or `pentagi-bridge`, with your home folder in place of `~` (names
+and approval policies are in that file). 5ire's Command field keeps only the first 128 characters and
+drops the rest without a word; these fit. `hexstrike` goes through the wrapper that adds HexStrike's
+API token. With a runtime root or clone folder other than the defaults, also give each entry the
+environment variables it has in that file (`SECOPS`, `SECSTACK_GH`): 5ire passes a server little of its
+own environment. Then block the log shipping (the audit wants both lines; leave out one `/etc/hosts`
+already has):
 
 ```bash
 printf '\n0.0.0.0 api.axiom.co\n:: api.axiom.co\n' | sudo tee -a /etc/hosts
@@ -160,9 +164,11 @@ secstack audit                   # 0 passed, 1 issues, 2 something wasn't checke
 - Claude Desktop: `claude off` and `claude on` replace an old HexStrike entry (one that runs
   `hexstrike_mcp.py` directly) with the one that goes through `mcp/hexstrike-client`; restart Claude after.
   Skip them if the entries are off: `claude on` would turn them on.
-- 5ire keeps the MCP servers it imported in its own database: if HexStrike (or pentagi-bridge) in
-  5ire > Tools doesn't run the commands in `~/GitHub/.sec-ops/configs/generated/5ire-mcp.json`, edit it
-  there.
+- 5ire keeps the MCP servers it imported in its own database: if a server in 5ire > Tools doesn't
+  connect ("MCP error -32000: Connection closed" in 5ire's log; HexStrike also needs `secstack mcp
+  on`), or still runs `hexstrike-env/bin/python3` or `hexstrike_mcp.py` without the wrapper, set its
+  command to `~/GitHub/.sec-ops/bin/secstack-mcp` followed by `hexstrike`, `kali-docs` or
+  `pentagi-bridge`, with your home folder in place of `~`.
 - If you chose other models at the `plan` step, also run `./setup.sh --only models` after the images, and
   `secstack providers --prune` in place of the `--create-only` sync (see "Changing models later").
 - If the audit says no model digests are recorded, or a recorded model is missing:

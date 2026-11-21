@@ -35,6 +35,7 @@ ENTRY = REPO / "configs" / "hexstrike-kali" / "hexstrike_entry.py"
 CLIENT = REPO / "mcp" / "hexstrike-client" / "hexstrike_client.py"
 SECSTACK = REPO / "bin" / "secstack"
 CTL = REPO / "bin" / "hexstrike-ctl"
+LAUNCHER = REPO / "bin" / "secstack-mcp"
 TOKEN = "0123456789abcdef" * 4          # a well-formed token (64 hex)
 OTHER = "f" * 64                         # well-formed, but not this install's token
 HEADER = "X-Secstack-Token"
@@ -1083,18 +1084,37 @@ class TestSecstackHexstrike(unittest.TestCase):
 # --------------------------------------------------------------------------- MCP config templates, setup.sh
 class TestClientConfigs(unittest.TestCase):
     WRAPPER = "__SECOPS__/mcp/hexstrike-client/hexstrike_client.py"
+    FIVEIRE = REPO / "configs" / "5ire" / "mcp.json"
 
-    def check_entry(self, e):
+    def test_templates_run_hexstrike_through_the_wrapper(self):
+        # Claude Desktop runs the wrapper itself; 5ire runs bin/secstack-mcp, which runs the same wrapper
+        # (TestMcpLauncher), because 5ire's Command field can't hold the full line.
+        e = json.loads((REPO / "configs" / "claude-desktop" / "mcp-servers.json").read_text())["hexstrike-ai"]
         self.assertEqual(e["command"], "__SECOPS__/venv/bin/python3")
         self.assertEqual(e["args"][:2], [self.WRAPPER, "__GH__/hexstrike-ai/hexstrike_mcp.py"])
         self.assertEqual(e["env"], {"SECOPS": "__SECOPS__"})
-
-    def test_templates_run_hexstrike_through_the_wrapper(self):
-        self.check_entry(json.loads((REPO / "configs" / "5ire" / "mcp.json").read_text())["mcpServers"]["hexstrike-ai"])
-        self.check_entry(json.loads((REPO / "configs" / "claude-desktop" / "mcp-servers.json").read_text())["hexstrike-ai"])
+        e = json.loads(self.FIVEIRE.read_text())["mcpServers"]["hexstrike-ai"]
+        self.assertEqual((e["command"], e["args"]), ("__SECOPS__/bin/secstack-mcp", ["hexstrike"]))
+        self.assertEqual(e["env"], {"SECOPS": "__SECOPS__", "SECSTACK_GH": "__GH__"})
         self.assertTrue(CLIENT.is_file())
 
-    def test_generated_5ire_config_points_at_the_wrapper(self):
+    def test_5ire_entries_fit_its_fields(self):
+        # 5ire (pinned 12c6a08, src/renderer/pages/tool/ServerEditDialog.tsx) keeps the first 64 characters of a
+        # name and 128 of a description or command line, and drops the rest without a word: an entry typed in
+        # 5ire > Tools from the generated file must fit, even under a long home folder.
+        home = "/Users/" + "u" * 32
+        servers = json.loads(self.FIVEIRE.read_text())["mcpServers"]
+        self.assertEqual(sorted(servers), ["hexstrike-ai", "kali-tools", "pentagi-bridge"])
+        for key, e in servers.items():
+            line = " ".join([e["command"]] + e["args"]).replace("__SECOPS__", home + "/GitHub/.sec-ops")
+            with self.subTest(server=key):
+                self.assertNotIn("__", line)
+                self.assertLessEqual(len(line), 128, line)
+                self.assertLessEqual(len(e["name"]), 64)
+                self.assertLessEqual(len(e["description"]), 128)
+                self.assertEqual(e["command"], "__SECOPS__/bin/secstack-mcp")
+
+    def test_generated_5ire_config_points_at_the_launcher(self):
         with tempfile.TemporaryDirectory() as d:
             secops = Path(d) / "sec-ops"
             with mock.patch.dict(os.environ, {"SECOPS": str(secops), "SECSTACK_GH": str(Path(d) / "GH")}):
@@ -1106,15 +1126,113 @@ class TestClientConfigs(unittest.TestCase):
                     e = json.loads(plan.fiveire_config())["mcpServers"]["hexstrike-ai"]
                 finally:
                     sys.modules.pop("plan_for_hexstrike", None)
-        self.assertEqual(e["args"][0], f"{secops}/mcp/hexstrike-client/hexstrike_client.py")
-        self.assertEqual(e["env"]["SECOPS"], str(secops))
+        self.assertEqual((e["command"], e["args"]), (f"{secops}/bin/secstack-mcp", ["hexstrike"]))
+        self.assertEqual(e["env"], {"SECOPS": str(secops), "SECSTACK_GH": str(Path(d) / "GH")})
         for placeholder in ("__SECOPS__", "__GH__", "__HOME__"):
             self.assertNotIn(placeholder, json.dumps(e))
 
     def test_no_em_dashes(self):
-        for p in (ENTRY, CLIENT, CTL, Path(__file__), REPO / "configs" / "5ire" / "mcp.json",
+        for p in (ENTRY, CLIENT, CTL, LAUNCHER, Path(__file__), REPO / "configs" / "5ire" / "mcp.json",
                   REPO / "configs" / "claude-desktop" / "mcp-servers.json"):
             self.assertNotIn(chr(0x2014), p.read_text(encoding="utf-8"), p)   # em dash
+
+
+@unittest.skipUnless(os.path.exists("/bin/sh"), "needs /bin/sh")
+class TestMcpLauncher(unittest.TestCase):
+    """bin/secstack-mcp NAME runs one MCP server with the same roots as bin/secstack, as a command short
+    enough for 5ire's Command field. Stubs stand in for the venv's python3 and for docker: each prints its
+    arguments and the roots it got, one per line."""
+
+    STUB = '#!/bin/sh\nfor a in "$@"; do echo "$a"; done\necho "SECOPS=$SECOPS"; echo "GH=$SECSTACK_GH"\n'
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.t = Path(self._tmp.name)
+        self.home = self.t / "home"
+        self.bin = self.t / "bin"                 # what PATH has first: the docker stub
+        self.bin.mkdir()
+        docker = self.bin / "docker"
+        docker.write_text(self.STUB)
+        docker.chmod(0o755)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def venv(self, secops):
+        py = secops / "venv" / "bin" / "python3"
+        py.parent.mkdir(parents=True)
+        py.write_text(self.STUB)
+        py.chmod(0o755)
+
+    def run_launcher(self, *args, **env):
+        # The environment an app started from Finder gives the servers it spawns: HOME and a short PATH.
+        base = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin"}
+        r = subprocess.run([str(LAUNCHER), *args], env=dict(base, **env), capture_output=True, text=True,
+                           timeout=30)
+        return r.returncode, r.stdout.splitlines(), r.stderr
+
+    def test_hexstrike_runs_the_wrapper_against_secstacks_server(self):
+        secops = self.home / "GitHub" / ".sec-ops"   # the defaults: ~/GitHub and its .sec-ops
+        self.venv(secops)
+        rc, out, err = self.run_launcher("hexstrike")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out, [f"{secops}/mcp/hexstrike-client/hexstrike_client.py",
+                               f"{self.home}/GitHub/hexstrike-ai/hexstrike_mcp.py",
+                               "--server", "http://127.0.0.1:8888",
+                               f"SECOPS={secops}", f"GH={self.home}/GitHub"])
+        # Options go on to hexstrike_mcp.py after the default --server, so a second one wins there.
+        rc, out, err = self.run_launcher("hexstrike", "--server", "http://127.0.0.1:9999")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out[2:6], ["--server", "http://127.0.0.1:8888", "--server", "http://127.0.0.1:9999"])
+
+    def test_roots_from_the_environment(self):
+        gh, secops = self.t / "clones", self.t / "runtime"
+        self.venv(secops)
+        rc, out, err = self.run_launcher("hexstrike", SECOPS=str(secops), SECSTACK_GH=str(gh))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out[:2], [f"{secops}/mcp/hexstrike-client/hexstrike_client.py",
+                                   f"{gh}/hexstrike-ai/hexstrike_mcp.py"])
+        self.assertEqual(out[-2:], [f"SECOPS={secops}", f"GH={gh}"])
+        rc, out, err = self.run_launcher("pentagi-bridge", SECOPS=str(secops), SECSTACK_GH=str(gh))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out, [f"{secops}/mcp/pentagi-bridge/pentagi_mcp.py", f"SECOPS={secops}", f"GH={gh}"])
+
+    def test_kali_docs_runs_the_offline_container(self):
+        rc, out, err = self.run_launcher("kali-docs")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out, ["run", "-i", "--rm", "--network=none", "--cpus=2", "--memory=512m", "--read-only",
+                               "--tmpfs", "/tmp", "kali-tools-mcp-server",
+                               f"SECOPS={self.home}/GitHub/.sec-ops", f"GH={self.home}/GitHub"])
+        # More arguments would become the container's command: refused, nothing on the MCP channel.
+        rc, out, err = self.run_launcher("kali-docs", "sh")
+        self.assertEqual((rc, out), (2, []))
+        self.assertIn("usage: secstack-mcp", err)
+
+    def test_entry_names_work_too(self):
+        # 5ire throws a server's stderr away, so a usage error there would look like any failed connection.
+        secops = self.home / "GitHub" / ".sec-ops"
+        self.venv(secops)
+        for name, alias in (("hexstrike", "hexstrike-ai"), ("kali-docs", "kali-tools")):
+            with self.subTest(alias=alias):
+                self.assertEqual(self.run_launcher(alias), self.run_launcher(name))
+                self.assertEqual(self.run_launcher(alias)[0], 0)
+
+    def test_missing_venv_leaves_the_mcp_channel_empty(self):
+        rc, out, err = self.run_launcher("hexstrike")      # no venv under the default root
+        self.assertIn(rc, (126, 127))                      # 126 from macOS /bin/sh (bash 3.2), 127 from dash
+        self.assertEqual(out, [])
+        self.assertIn("venv/bin/python3", err)
+
+    def test_unknown_or_missing_server(self):
+        for args in ((), ("nope",), ("",)):
+            with self.subTest(args=args):
+                rc, out, err = self.run_launcher(*args)
+                self.assertEqual((rc, out), (2, []))
+                self.assertIn("usage: secstack-mcp hexstrike", err)
+
+    def test_is_an_executable_sh_script(self):
+        self.assertTrue(os.access(LAUNCHER, os.X_OK))
+        self.assertTrue(LAUNCHER.read_text().startswith("#!/bin/sh\n"))
 
 
 @unittest.skipUnless(HAVE_BASH, "needs bash")
@@ -1123,13 +1241,16 @@ class TestSetup5ire(unittest.TestCase):
     imports the file once, on its first launch, and records that in Stories/legacy-data-migrator.store: before
     that the file is to be fixed, after it the server in 5ire > Tools."""
 
-    def run_step(self, mcp_json, imported=False, other_files=False):
+    def run_step(self, mcp_json, imported=False, other_files=False, default_roots=False):
         text = (REPO / "setup.sh").read_text()
         m = re.search(r"^step_5ire\(\)\{\n.*?^\}\n", text, re.S | re.M)
         self.assertIsNotNone(m, "step_5ire not found in setup.sh")
         with tempfile.TemporaryDirectory() as d:
             t = Path(d)
-            cfg = t / "sec-ops" / "configs"
+            # The defaults are ~/GitHub and ~/GitHub/.sec-ops; otherwise both are elsewhere.
+            gh = t / "home" / "GitHub" if default_roots else t / "GH"
+            secops = gh / ".sec-ops" if default_roots else t / "sec-ops"
+            cfg = secops / "configs"
             (cfg / "generated").mkdir(parents=True)
             (cfg / "generated" / "5ire-mcp.json").write_text("{}\n")
             fivedir = t / "home" / "Library" / "Application Support" / "5ire"
@@ -1145,7 +1266,7 @@ class TestSetup5ire(unittest.TestCase):
                        'PENDING=""; pend(){ PENDING="$PENDING - $*\n"; }; q(){ printf "%q" "$1"; }\n'
                        'ask_yn(){ return 1; }; conf_get(){ :; }; INTERACTIVE=0\n'
                        + m.group(0) + 'step_5ire\nprintf "%s" "$PENDING"\n')
-            env = dict(os.environ, HOME=str(t / "home"), CFG=str(cfg), SECOPS=str(t / "sec-ops"))
+            env = dict(os.environ, HOME=str(t / "home"), CFG=str(cfg), SECOPS=str(secops), GH=str(gh))
             r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=60)
             wrote = mcp_json is None and (fivedir / "mcp.json").exists()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1160,7 +1281,7 @@ class TestSetup5ire(unittest.TestCase):
                 out, _ = self.run_step(self.OLD, other_files=other_files)
                 self.assertIn("warn: 5ire's mcp.json runs hexstrike_mcp.py without the API token wrapper", out)
                 self.assertIn("Before opening 5ire", out)
-                self.assertIn("hexstrike_client.py", out)
+                self.assertIn("secstack-mcp", out)
 
     def test_current_entry_passes(self):
         cur = json.loads((REPO / "configs" / "5ire" / "mcp.json").read_text())
@@ -1175,23 +1296,45 @@ class TestSetup5ire(unittest.TestCase):
         self.assertNotIn("ok: 5ire imported mcp.json", out)
         todo = [l for l in out.splitlines() if l.startswith(" - ") and "hexstrike" in l.lower()]
         self.assertEqual(len(todo), 1, out)
-        self.assertIn("In 5ire > Tools, change the hexstrike-ai server to run through", todo[0])
-        self.assertIn("hexstrike_client.py", todo[0])
-        self.assertIn("5ire-mcp.json", todo[0])                                 # where the command is
+        self.assertIn("In 5ire > Tools, set the hexstrike-ai server's command to: ", todo[0])
+        self.assertIn("/bin/secstack-mcp hexstrike" + self.ROOTS, todo[0])         # roots other than the defaults
+        self.assertIn("5ire-mcp.json", todo[0])                                 # where the full entries are
         self.assertNotIn("Before opening 5ire", out)                           # the file itself is never read again
         # Imported with a current entry: nothing to fix.
         cur = json.loads((REPO / "configs" / "5ire" / "mcp.json").read_text())
         out, _ = self.run_step(cur, imported=True)
         self.assertNotIn("without the API token wrapper", out)
         self.assertIn("ok: 5ire imported mcp.json on its first launch", out)
-        self.assertIn("5ire > Tools", out)
+        self.assertIn("if you edit it there, use: ", out)
+        self.assertIn("/bin/secstack-mcp hexstrike", out)
         self.assertEqual([l for l in out.splitlines() if l.startswith(" - ") and "hexstrike" in l.lower()], [])   # no to-do
 
+    ADD = " - Add or fix HexStrike / Kali docs / pentagi-bridge in 5ire > Tools, one command each: "
+    LAUNCH = "/bin/secstack-mcp hexstrike, kali-docs or pentagi-bridge"
+    ROOTS = ", with environment variables SECOPS="
+
     def test_opened_without_mcp_json_lists_what_to_add(self):
+        # The roots are not the defaults here, so the entries need them as environment variables.
         out, wrote = self.run_step(None, imported=True)
         self.assertFalse(wrote)
         self.assertIn("opened before", out)
-        self.assertIn(" - Add HexStrike", out)
+        todo = [l for l in out.splitlines() if l.startswith(self.ADD)]
+        self.assertEqual(len(todo), 1, out)
+        self.assertIn(self.LAUNCH + self.ROOTS, todo[0])
+        self.assertIn(" and SECSTACK_GH=", todo[0])
+        # With the default roots, the command alone does.
+        out, _ = self.run_step(None, imported=True, default_roots=True)
+        todo = [l for l in out.splitlines() if l.startswith(self.ADD)]
+        self.assertEqual(len(todo), 1, out)
+        self.assertIn(self.LAUNCH + " (names and approval policies: ", todo[0])
+        self.assertNotIn("environment variables", out)
+
+    def test_own_mcp_json_without_secstacks_servers(self):
+        # Not imported yet, no old HexStrike entry, none of secstack's servers: left as it is, with a to-do.
+        out, wrote = self.run_step({"mcpServers": {"mine": {"command": "/x/mine"}}}, default_roots=True)
+        self.assertFalse(wrote)
+        self.assertIn("ok: 5ire mcp.json exists; left untouched", out)
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith(self.ADD) and self.LAUNCH in l]), 1, out)
 
     def test_fresh_5ire_gets_the_generated_file(self):
         out, wrote = self.run_step(None)
@@ -1244,12 +1387,14 @@ class TestClaudeToggleMigration(unittest.TestCase):
         self.check_wrapper(self.entry(self.cfg))
 
     def test_current_entries_are_left_alone(self):
-        mine = {"command": "/x/py", "args": ["/x/hexstrike_client.py", "/x/hexstrike_mcp.py", "--custom"]}
-        self.cfg.write_text(json.dumps({"mcpServers": {}}))
-        self.stash.write_text(json.dumps({"hexstrike-ai": mine}))
-        rc, out = self.secstack("claude_toggle on")
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(self.entry(self.cfg), mine)
+        for mine in ({"command": "/x/py", "args": ["/x/hexstrike_client.py", "/x/hexstrike_mcp.py", "--custom"]},
+                     {"command": "/x/.sec-ops/bin/secstack-mcp", "args": ["hexstrike"]}):
+            with self.subTest(mine=mine):
+                self.cfg.write_text(json.dumps({"mcpServers": {}}))
+                self.stash.write_text(json.dumps({"hexstrike-ai": mine}))
+                rc, out = self.secstack("claude_toggle on")
+                self.assertEqual(rc, 0, out)
+                self.assertEqual(self.entry(self.cfg), mine)
 
 
 if __name__ == "__main__":

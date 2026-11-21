@@ -805,8 +805,9 @@ def subst(x):
 def current(entries):
     # An entry from before the HexStrike API token ran hexstrike_mcp.py directly; the API now refuses
     # it, so it is replaced with the template's entry (through mcp/hexstrike-client), wherever it is.
+    # One that runs bin/secstack-mcp goes through the same wrapper and is kept.
     e = entries.get("hexstrike-ai")
-    if isinstance(e, dict) and "hexstrike_client.py" not in json.dumps(e):
+    if isinstance(e, dict) and not any(w in json.dumps(e) for w in ("hexstrike_client.py", "secstack-mcp")):
         entries["hexstrike-ai"] = subst(json.load(open(tmpl)))["hexstrike-ai"]
 def write(path, data):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")

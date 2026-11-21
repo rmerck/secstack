@@ -490,6 +490,13 @@ step_5ire(){
   # launch, records that in Stories/legacy-data-migrator.store and never reads or rewrites the file again. So
   # the file's HexStrike entry is checked only until then; after that, 5ire's servers live in 5ire > Tools.
   local old_entry=0   # mcp.json's HexStrike entry predates the token wrapper (HexStrike answers it 401)
+  local cmd roots=""  # what to type in 5ire > Tools: bin/secstack-mcp NAME fits its 128-character Command field
+  cmd="$(q "$SECOPS/bin/secstack-mcp")"
+  # 5ire gives a server only HOME, PATH and a few more variables, plus the entry's own: with roots other than
+  # the defaults, the launcher needs them in the entry's environment variables, or it looks in ~/GitHub.
+  if [ "${GH:-}" != "$HOME/GitHub" ] || [ "$SECOPS" != "${GH:-}/.sec-ops" ]; then
+    roots=", with environment variables SECOPS=$(q "$SECOPS") and SECSTACK_GH=$(q "${GH:-}")"
+  fi
   if [ -e "$dir/mcp.json" ] && { grep -q 'hexstrike-env/bin/python3' "$dir/mcp.json" 2>/dev/null \
        || { grep -q 'hexstrike_mcp\.py' "$dir/mcp.json" 2>/dev/null && ! grep -q 'hexstrike_client\.py' "$dir/mcp.json" 2>/dev/null; }; }; then
     old_entry=1
@@ -498,20 +505,20 @@ step_5ire(){
     if [ $old_entry -eq 1 ]; then
       # What 5ire imported came from this file, so its database most likely holds the old entry too.
       warn "5ire imported a HexStrike entry without the API token wrapper on its first launch (HexStrike answers it 401)"
-      pend "In 5ire > Tools, change the hexstrike-ai server to run through $(q "$SECOPS/mcp/hexstrike-client/hexstrike_client.py") (the command is in $(q "$src"))"
+      pend "In 5ire > Tools, set the hexstrike-ai server's command to: $cmd hexstrike$roots (it adds the API token; the full entries are in $(q "$src"))"
     else
-      ok "5ire imported mcp.json on its first launch and keeps its MCP servers in its own database: change them in 5ire > Tools (the HexStrike entry must run through $(q "$SECOPS/mcp/hexstrike-client/hexstrike_client.py"); without it HexStrike answers 401)"
+      ok "5ire imported mcp.json on its first launch and keeps its MCP servers in its own database: change them in 5ire > Tools (HexStrike's must go through the token wrapper, or HexStrike answers 401; if you edit it there, use: $cmd hexstrike$roots)"
     fi
   elif [ -e "$dir/mcp.json" ]; then
     if [ $old_entry -eq 1 ]; then
       warn "5ire's mcp.json runs hexstrike_mcp.py without the API token wrapper (HexStrike refuses it), and 5ire imports it on its first launch"
-      pend "Before opening 5ire, replace the hexstrike-ai entry in $(q "$dir/mcp.json") with the one in $(q "$src"): HexStrike runs through $(q "$SECOPS/mcp/hexstrike-client/hexstrike_client.py"), which adds its API token"
+      pend "Before opening 5ire, replace the hexstrike-ai entry in $(q "$dir/mcp.json") with the one in $(q "$src"): it runs HexStrike through $cmd, which adds its API token"
     elif grep -q 'pentagi-bridge' "$dir/mcp.json" 2>/dev/null; then ok "5ire mcp.json already lists the secstack servers (5ire imports it on its first launch)"
-    else ok "5ire mcp.json exists; left untouched"; pend "Add HexStrike / Kali docs / pentagi-bridge in 5ire > Tools from $(q "$src")"; fi
+    else ok "5ire mcp.json exists; left untouched"; pend "Add or fix HexStrike / Kali docs / pentagi-bridge in 5ire > Tools, one command each: $cmd hexstrike, kali-docs or pentagi-bridge$roots (names and approval policies: $(q "$src"))"; fi
   elif [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
     # 5ire reads mcp.json only on its very first launch; after that, servers are added in the app.
     ok "5ire has been opened before; not writing mcp.json"
-    pend "Add HexStrike / Kali docs / pentagi-bridge in 5ire > Tools, using the commands in $(q "$src")"
+    pend "Add or fix HexStrike / Kali docs / pentagi-bridge in 5ire > Tools, one command each: $cmd hexstrike, kali-docs or pentagi-bridge$roots (names and approval policies: $(q "$src"))"
   else
     mkdir -p "$dir"; ( umask 077; cp "$src" "$dir/mcp.json" ); ok "wrote $dir/mcp.json (5ire imports it on first launch)"
   fi

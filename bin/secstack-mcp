@@ -1,0 +1,43 @@
+#!/bin/sh
+# secstack-mcp: start one of secstack's MCP servers on stdin/stdout, for an MCP client to run.
+#
+#   secstack-mcp hexstrike [options]   HexStrike's client (hexstrike_mcp.py) with the API token
+#   secstack-mcp kali-docs             offline Kali tool docs: no network, read-only
+#   secstack-mcp pentagi-bridge        start, watch and stop pentagi flows
+#
+# It makes each server one short command. 5ire's Command field (pinned 12c6a08,
+# src/renderer/pages/tool/ServerEditDialog.tsx: maxLength 128) keeps only the first 128 characters
+# of what you type or paste, and the full lines (venv python, script, arguments) are longer.
+# stdout is the MCP channel: the only thing this prints itself is its usage, on stderr (which 5ire
+# discards). The entries' own names work too: hexstrike-ai, kali-tools.
+
+GH="${SECSTACK_GH:-$HOME/GitHub}"    # the folder with the upstream clones, as in bin/secstack
+SECOPS="${SECOPS:-$GH/.sec-ops}"      # the runtime root: host venv, MCP scripts, tokens
+export SECSTACK_GH="$GH" SECOPS       # so the servers use the same roots
+py="$SECOPS/venv/bin/python3"         # the host venv, with the servers' hash-locked dependencies
+
+usage(){
+  echo "usage: secstack-mcp hexstrike [hexstrike_mcp.py options] | kali-docs | pentagi-bridge" >&2
+  exit 2
+}
+
+name="${1:-}"
+[ $# -gt 0 ] && shift
+case "$name" in
+  hexstrike|hexstrike-ai)            # also the name of its entry in 5ire and Claude Desktop
+    # The wrapper adds the API token to requests for --server (127.0.0.1:8888, where secstack
+    # publishes HexStrike) and runs the upstream hexstrike_mcp.py unchanged. Options given here
+    # come after this --server, so they win.
+    exec "$py" "$SECOPS/mcp/hexstrike-client/hexstrike_client.py" \
+      "$GH/hexstrike-ai/hexstrike_mcp.py" --server http://127.0.0.1:8888 "$@" ;;
+  kali-docs|kali-tools)
+    [ $# -eq 0 ] || usage              # anything more would replace the image's own command
+    # Apps started from Finder get a PATH without Docker's CLI: add its usual homes at the end.
+    PATH="$PATH:/Applications/Docker.app/Contents/Resources/bin:/usr/local/bin"
+    exec docker run -i --rm --network=none --cpus=2 --memory=512m --read-only --tmpfs /tmp \
+      kali-tools-mcp-server ;;
+  pentagi-bridge)
+    exec "$py" "$SECOPS/mcp/pentagi-bridge/pentagi_mcp.py" "$@" ;;
+  *)
+    usage ;;
+esac

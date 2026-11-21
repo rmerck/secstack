@@ -20,6 +20,7 @@ in `scope.cidrs`.
 | DVWA + Juice Shop | vulnerables/web-dvwa, bkimminich/juice-shop | Local benchmark lab: 172.30.0.10/.11 on pentest-net, 172.30.1.10/.11 on hexstrike-net |
 | `secstack` | this repo | Single control script for all of the above |
 | pentagi-bridge, hexstrike-client | this repo | Stdio MCP servers: 5ire starts and watches pentagi flows; HexStrike's client with its token |
+| secstack-mcp | this repo | One short command per MCP server (`hexstrike`, `kali-docs`, `pentagi-bridge`): 5ire's Command field keeps 128 characters |
 | secops-flow | this repo | Flow reports, watcher, NVD CVE verification, benchmarks, template/provider sync |
 | plan.py | this repo | Hardware detection, memory/CPU sizing, model catalog, recommendation, model install |
 
@@ -206,7 +207,8 @@ and localhost, and what these ports serve is agent-made (the lab serves planted 
 - **5ire** packaged builds ship app logs to Axiom (`api.axiom.co`). setup offers to add the missing
   IPv4 and IPv6 `/etc/hosts` lines; the audit wants both. 5ire imports `mcp.json` into its own database
   on its first launch and never reads the file again: after that, its MCP servers are changed in
-  5ire > Tools.
+  5ire > Tools, whose Command field keeps only the first 128 characters (the entries run
+  `bin/secstack-mcp NAME`, which fits).
 - **pentagi provider sync** (`secstack providers`, pentagi running) creates the plan's providers; it
   updates existing ones only without `--create-only`, after a 600 backup in `$SECOPS/logs`. `--prune`
   deletes only names the plan generates, and not at all when a provider file failed to load.

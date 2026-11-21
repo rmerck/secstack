@@ -163,9 +163,10 @@ with os.fdopen(fd, "w") as f:
     json.dump(data, f, indent=2)
 PY
     say "seed    configs/mcp-servers.stash.json"; }
-elif ! grep -F 'hexstrike_client.py' "$SECOPS/configs/mcp-servers.stash.json" >/dev/null 2>&1 \
+elif ! grep -F -e 'hexstrike_client.py' -e 'secstack-mcp' "$SECOPS/configs/mcp-servers.stash.json" >/dev/null 2>&1 \
      && grep -F '"hexstrike-ai"' "$SECOPS/configs/mcp-servers.stash.json" >/dev/null 2>&1; then
-  # Earlier versions ran hexstrike_mcp.py directly; the API now needs the token the wrapper adds.
+  # Earlier versions ran hexstrike_mcp.py directly; the API now needs the token the wrapper adds
+  # (an entry that runs bin/secstack-mcp goes through it too).
   would "update the hexstrike-ai entry in configs/mcp-servers.stash.json (HexStrike API token)" || {
     if python3 - "$REPO/configs/claude-desktop/mcp-servers.json" "$SECOPS/configs/mcp-servers.stash.json" "$GH" "$SECOPS" "$HOME" <<'PY'
 import json, os, sys, tempfile

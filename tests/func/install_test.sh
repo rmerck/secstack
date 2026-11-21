@@ -306,6 +306,13 @@ PY
 [ "$(mode "$MS/configs/mcp-servers.stash.json")" = 600 ] && ok "stash: still 600" || bad "stash: mode $(mode "$MS/configs/mcp-servers.stash.json")"
 (export HOME="$MH" SECSTACK_GH="$MH/GitHub"; unset SECOPS; "$R/install.sh") > "$T/m3" 2>&1
 ! grep -q 'hexstrike-ai' "$T/m3" && ok "stash: migrated once" || { bad "stash: migrated again"; cat "$T/m3"; }
+# An entry that runs bin/secstack-mcp goes through the same token wrapper: left as it is.
+printf '%s\n' '{"hexstrike-ai": {"command": "/x/.sec-ops/bin/secstack-mcp", "args": ["hexstrike"]}}' \
+  > "$MS/configs/mcp-servers.stash.json"
+before=$(cat "$MS/configs/mcp-servers.stash.json")
+(export HOME="$MH" SECSTACK_GH="$MH/GitHub"; unset SECOPS; "$R/install.sh") > "$T/m4" 2>&1
+[ "$(cat "$MS/configs/mcp-servers.stash.json")" = "$before" ] && ! grep -q 'hexstrike-ai' "$T/m4" \
+  && ok "stash: an entry that runs secstack-mcp is kept" || { bad "stash: secstack-mcp entry replaced"; cat "$T/m4"; }
 
 echo "install: $pass passed, $fail failed"
 [ $fail -eq 0 ]
