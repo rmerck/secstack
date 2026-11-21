@@ -639,6 +639,11 @@ FAKE_HDI=198.18.0.77 run scope test; has "host.docker.internal 198.18.0.77:11434
 tamper 'v4["SECOPS-SCOPE"].insert(0, "-d 198.18.0.77/32 -j RETURN")'
 FAKE_HDI=198.18.0.77 run scope test && bad "scope test missed a leak to host.docker.internal" \
   || has "host.docker.internal 198.18.0.77:11434 REACHABLE (leak)" "scope test catches a leak to the resolved host.docker.internal"
+# Newer Docker Desktop VMs keep the default route in policy-routing table 2, none in main: found anyway
+tamper 'v4["SECOPS-SCOPE"] = [r for r in v4["SECOPS-SCOPE"] if "198.18.0.0/24" not in r]'
+FAKE_UPLINK_TABLE=2 run scope apply && ok "default route in a policy table: apply works" || { bad "policy-table uplink: apply failed"; tail -5 "$T/out"; }
+[ "$(st '"-d 198.18.0.0/24 -j REJECT --reject-with icmp-net-prohibited" in v4["SECOPS-SCOPE"]')" = yes ] \
+  && ok "...and the VM's uplink network is still reserved" || bad "policy-table uplink not reserved"
 export FAKE_UPLINK=""
 cp "$FAKE_IPT_STATE" "$T/before.json"; n0=$(vm_scripts)
 mustnot scope apply && has "couldn't read the Docker VM's own network" "no uplink: refuses to apply"

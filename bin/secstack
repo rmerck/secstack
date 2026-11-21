@@ -198,7 +198,10 @@ vm_sh(){
 # The Docker VM's own uplink network (192.168.65.0/24 unless changed in Docker Desktop's settings) holds
 # host.docker.internal, so it is reserved like RESERVED_NETS. VM_UPLINK_SH prints "uplink ADDR/LEN" lines
 # for the default route's interface (busybox sh in the VM); uplink_nets turns them into networks.
-VM_UPLINK_SH='d=$(ip -4 route show default 2>/dev/null | sed -n "s/.* dev \([^ ]*\).*/\1/p" | head -n 1); [ -n "$d" ] && ip -4 addr show dev "$d" 2>/dev/null | sed -n "s/^ *inet \([0-9.]*\/[0-9]*\).*/uplink \1/p"'
+# Newer Docker Desktop VMs keep the default route in a policy-routing table (`ip rule` ... lookup 2), not in
+# main: then the interface comes from `ip route get` for a public address, which follows the rules (no
+# packet is sent).
+VM_UPLINK_SH='d=$(ip -4 route show default 2>/dev/null | sed -n "s/.* dev \([^ ]*\).*/\1/p" | head -n 1); [ -n "$d" ] || d=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n "s/.* dev \([^ ]*\).*/\1/p" | head -n 1); [ -n "$d" ] && ip -4 addr show dev "$d" 2>/dev/null | sed -n "s/^ *inet \([0-9.]*\/[0-9]*\).*/uplink \1/p"'
 uplink_nets(){ # stdin: VM output; prints the uplink networks, space separated (nothing if none)
   python3 -c '
 import ipaddress, sys

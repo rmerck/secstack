@@ -24,7 +24,7 @@ answers a connection made to it).
 
 Environment: FAKE_IPT_FAIL_AT=N makes the Nth iptables/ip6tables call fail (exit 4, like a held xtables
 lock). FAKE_UPLINK=ADDR/LEN is the VM's uplink address (default 192.168.65.3/24; empty means no default
-route). FAKE_BRNF_LOCKED=1 makes bridge-nf-call-iptables impossible to set; FAKE_SYSCTL_STUCK=KEY makes writes to
+route); FAKE_UPLINK_TABLE=N keeps that default route in policy-routing table N instead of main. FAKE_BRNF_LOCKED=1 makes bridge-nf-call-iptables impossible to set; FAKE_SYSCTL_STUCK=KEY makes writes to
 sysctl KEY "succeed" while its value stays as it was. FAKE_NO_IPV6=1 is a kernel without IPv6 (no net.ipv6 keys).
 FAKE_CONNTRACK_RC is conntrack's exit code. FAKE_DOCKER_USER_EMPTY=1 starts DOCKER-USER empty (Docker
 28.2.2 and later) instead of with Docker's old "-j RETURN". FAKE_IPT_FAIL_FLUSH=CHAIN also empties CHAIN when the
@@ -175,9 +175,19 @@ def sysctl(args):
 def ip(args):
     up = uplink()
     a = [x for x in args if x != "-4"]
+    # FAKE_UPLINK_TABLE=N: the default route lives in policy-routing table N (newer Docker Desktop VMs), so
+    # the main table has none and only `ip route get` (which follows the rules) finds the uplink.
+    table = os.environ.get("FAKE_UPLINK_TABLE", "")
     if a[:3] == ["route", "show", "default"]:
-        if up:
+        if up and not table:
             print("default via %s dev eth0 " % (up.network.network_address + 1))
+        return 0
+    if a[:2] == ["route", "get"] and len(a) >= 3:
+        if not up:
+            return err("RTNETLINK answers: Network is unreachable", 2)
+        print("%s via %s dev eth0 %ssrc %s uid 0 " % (a[2], up.network.network_address + 1,
+                                                    "table %s " % table if table else "", up.ip))
+        print("    cache ")
         return 0
     if a[:2] == ["addr", "show"] and "dev" in a:
         if up and a[a.index("dev") + 1] == "eth0":
