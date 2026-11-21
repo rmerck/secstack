@@ -202,7 +202,8 @@ class TestSetup(unittest.TestCase):
         (cls.repo / "bin" / "secstack").unlink()
         (cls.repo / "bin" / "secstack").write_text(
             '#!/bin/sh\necho "secstack $*" >> "$SANDBOX/log"\n'
-            'case "$1" in audit) exit "${FAKE_AUDIT_RC:-0}" ;; pentagi) exit "${FAKE_PENTAGI_RC:-0}" ;; esac\nexit 0\n')
+            'case "$1" in audit) exit "${FAKE_AUDIT_RC:-0}" ;; pentagi) exit "${FAKE_PENTAGI_RC:-0}" ;;\n'
+            '  templates) exit "${FAKE_TEMPLATES_RC:-0}" ;; esac\nexit 0\n')
         os.chmod(cls.repo / "bin" / "secstack", 0o755)
         cls.stubs = sb / "stubs"
         cls.stubs.mkdir()
@@ -575,6 +576,25 @@ class TestSetup(unittest.TestCase):
                     self.assertEqual(rc, 0, out)
                     self.assertNotIn("secstack pentagi", self.log())
                     self.assertIn("Finish the pentagi step later: ./setup.sh --only pentagi", self.todo(out))
+
+    def test_template_sync_refused_to_api_tokens_asks_for_the_ui(self):
+        # pentagi serves flow templates to browser logins only: `secstack templates` exits 3, and the item
+        # asks for them in the UI instead of blaming the token. Any other failure still blames the token.
+        for bash in shells():
+            for rc, want, unwanted in (("3", "Add the flow templates in pentagi's UI", "pentagi sync failed"),
+                                       ("1", "pentagi sync failed", "Add the flow templates")):
+                with self.subTest(bash=bash, rc=rc):
+                    self.setUp()
+                    (self.sb / "lo0_alias").touch()
+                    (self.secops / "env").mkdir(parents=True, exist_ok=True)
+                    (self.secops / "env" / "pentagi-api-token").write_text("tok_" + "a" * 40 + "\n")
+                    self.env["FAKE_TEMPLATES_RC"] = rc
+                    out, code = self.setup_plain(bash, ["--only", "pentagi", "--yes"])
+                    self.assertEqual(code, 0, out)
+                    self.assertIn("secstack templates --create-only", self.log())
+                    todo = self.todo(out)
+                    self.assertEqual(len([t for t in todo if t.startswith(want)]), 1, out)
+                    self.assertEqual([t for t in todo if unwanted in t], [], out)
 
     def test_pentagi_step_waits_for_the_loopback_alias(self):
         # `secstack pentagi` refuses without 127.0.0.2 on lo0, so a fresh Mac that declined the loopback step

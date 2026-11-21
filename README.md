@@ -66,7 +66,8 @@ secstack report FLOW [--expect vendor[,product]]  evidence + NVD check of the CV
 secstack watch FLOW [--down] | watch stop [FLOW]  notify on finish or stall, report automatically
 secstack verify-cve FILE... [--expect vendor[,product]]
 secstack providers [--create-only] [--prune]      sync the plan's pentagi providers (pentagi running)
-secstack templates [--create-only]                sync flow templates (pentagi running)
+secstack templates [--create-only]                sync flow templates (pentagi running); pentagi
+                                                  refuses API tokens here: add them in its UI
 secstack plan | status | audit | models | bench
 secstack stop                      stop flow watchers, frameworks, hexstrike and lab; keep Docker + Ollama
 secstack down                      stop everything, release Docker VM memory

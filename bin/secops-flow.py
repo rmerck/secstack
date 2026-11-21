@@ -1342,7 +1342,16 @@ def template_sync(create_only=False):
     if not items:
         print(f"no templates in {TEMPLATES}", file=sys.stderr)
         return 1
-    cur = (gql("query{flowTemplates{id title text createdAt updatedAt}}") or {}).get("flowTemplates") or []
+    try:
+        cur = (gql("query{flowTemplates{id title text createdAt updatedAt}}") or {}).get("flowTemplates") or []
+    except RuntimeError as e:
+        if isinstance(e, ApiError) or "not permitted" not in str(e):
+            raise
+        # pentagi serves flow templates to browser logins (user sessions) only, never to an API token, so
+        # there's nothing to sync from here: exit 3 tells setup to ask for them in the UI instead.
+        print(f"pentagi doesn't let API tokens manage flow templates; add them in its UI (Templates) from "
+              f"{TEMPLATES}/*.md: first line = title, the rest = text", file=sys.stderr)
+        return 3
     existing = {t["title"]: t for t in cur}
     changing = [existing[t] for t, x in items if t in existing and existing[t].get("text") != x]
     if changing and not create_only:
@@ -1508,6 +1517,9 @@ def main():
     except requests.RequestException as e:   # type only: messages can echo request headers
         print(f"secops-flow: can't reach pentagi at {BASE} ({type(e).__name__}); is it running? secstack pentagi",
               file=sys.stderr)
+        return 2
+    except RuntimeError as e:                # a GraphQL error from pentagi: its message, not a traceback
+        print(f"secops-flow: {e}", file=sys.stderr)
         return 2
 
 

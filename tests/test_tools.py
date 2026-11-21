@@ -61,6 +61,7 @@ class FakePentagi:
         self.providers, self.templates, self.next_id = [], [], 1
         self.full_query_ok, self.fail_names, self.auth_failures = True, set(), 0
         self.fail_message = "boom"
+        self.templates_for_users_only = False
 
     def _id(self):
         self.next_id += 1
@@ -86,6 +87,8 @@ class FakePentagi:
             self.providers = [p for p in self.providers if p["id"] != v["id"]]
             return {"data": {"deleteProvider": "success"}}
         if "flowTemplates" in q:
+            if self.templates_for_users_only:          # pentagi: API tokens can't read templates
+                return {"errors": [{"message": "not permitted"}]}
             return {"data": {"flowTemplates": [dict(t) for t in self.templates]}}
         if "createFlowTemplate" in q:
             self.templates.append({"id": self._id(), **v["i"]})
@@ -301,6 +304,25 @@ class TestSecopsFlowSync(unittest.TestCase):
         self.assertEqual(next(t for t in self.fake.templates if t["title"] == "Alpha")["text"], "body one, edited")
         self.assertIn("same     Beta", out)
         self.assertEqual(len(self.backups("templates")), 1)
+
+    def test_templates_refused_to_api_tokens(self):
+        # The pinned pentagi serves flow templates to browser logins only: sync says so and exits 3 (setup
+        # then asks for them in the UI), and the CLI prints no traceback for other GraphQL errors either.
+        (self.tdir / "10-a.md").write_text("# Alpha\nbody one\n")
+        self.fake.templates_for_users_only = True
+        rc, out = self.run_sync(self.flow.template_sync, True)
+        self.assertEqual(rc, 3, out)
+        self.assertIn("doesn't let API tokens manage flow templates", out)
+        self.assertEqual(self.fake.templates, [])
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["secops-flow", "template-sync", "--create-only"]), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.flow.main(), 3)
+        self.assertNotIn("Traceback", err.getvalue())
+        with mock.patch.object(self.flow, "template_sync", side_effect=RuntimeError("pentagi /graphql: boom")), \
+                mock.patch.object(sys, "argv", ["secops-flow", "template-sync"]), contextlib.redirect_stderr(err):
+            self.assertEqual(self.flow.main(), 2)
+        self.assertIn("secops-flow: pentagi /graphql: boom", err.getvalue())
 
     def test_missing_token_is_a_clean_error(self):
         (self.secops / "env" / "pentagi-api-token").unlink()

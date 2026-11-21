@@ -429,9 +429,14 @@ EOF
   fi
   if [ -s "$tokf" ]; then
     # Create what's missing; never overwrite providers/templates you tuned in the UI (`secstack providers` updates).
-    local synced=1
+    local synced=1 rc
     "$SECSTACK" providers --create-only || { synced=0; warn "provider sync failed"; }
-    "$SECSTACK" templates --create-only || { synced=0; warn "template sync failed"; }
+    rc=0; "$SECSTACK" templates --create-only || rc=$?   # (|| keeps set -e from ending setup here)
+    case $rc in
+      0) ;;
+      3) pend "Add the flow templates in pentagi's UI (Templates): pentagi lets only a browser login manage them. The texts are in $(q "$SECOPS/configs/flow-templates") (first line = title)" ;;
+      *) synced=0; warn "template sync failed" ;;
+    esac
     [ $synced -eq 1 ] || pend "pentagi sync failed. If the token is wrong or expired: rm $(q "$tokf"), then ./setup.sh --only pentagi"
   fi
 }

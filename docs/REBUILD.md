@@ -28,7 +28,7 @@ Use a native arm64 terminal; setup stops under Rosetta.
 | `loopback` | Puts 127.0.0.2 on lo0 now and installs `/Library/LaunchDaemons/com.secstack.lo0-alias.plist`, which adds it at every boot: pentagi's terminal ports and `secstack lab up --ui` publish there. Asks before sudo; with `--yes` it is listed at the end. | `sudo ifconfig lo0 alias 127.0.0.2 up` (until the next reboot) |
 | `images` | Builds `hexstrike-kali` (20-40 min; it fails if `apt-get update` fails or no tool installs) and `kali-tools-mcp-server`; pulls the images in `upstream/images.lock` that are missing. Present images are never upgraded. | `scripts/build-images.sh` (`--pull` to upgrade on purpose) |
 | `models` | Starts Ollama with the planned context/parallel/KV settings and no `OLLAMA_ORIGINS` (if an Ollama.app setting overrides them, it stops Ollama and names it), pulls or imports the chosen models (GGUF: commit-pinned and sha256-verified), builds each alias under a temporary name, checks its weights against the catalog pin and its tool calling, and only then puts it in place and reads it back. Pulls and checks the embedding model, and records the manifest digest each model passed its checks with. | `secstack llm start && scripts/models.sh` |
-| `pentagi` | Starts pentagi and its restart guard (asks first if ARTEX or a pentagi flow is running; skipped with a to-do while 127.0.0.2 isn't on lo0; refuses an unsafe `.env`), asks you to change the default password and create an API token (pasted hidden, saved 600; the clipboard is cleared if it still holds the token), then creates the plan's providers and templates that don't exist yet | see below |
+| `pentagi` | Starts pentagi and its restart guard (asks first if ARTEX or a pentagi flow is running; skipped with a to-do while 127.0.0.2 isn't on lo0; refuses an unsafe `.env`), asks you to change the default password and create an API token (pasted hidden, saved 600; the clipboard is cleared if it still holds the token), then creates the plan's providers that don't exist yet. Flow templates are a to-do: pentagi lets only a browser login manage them | see below |
 | `artex` | Starts ARTEX (asks first if a pentagi flow is running; an idle pentagi is stopped); if it isn't claimed yet, copies the one-time setup token to the clipboard and clears it however setup ends | see below |
 | `5ire` | Writes 5ire's `mcp.json` only on a 5ire that has never been opened: 5ire imports that file into its own database on its first launch and never reads it again. Before that launch, a HexStrike entry in `mcp.json` without the token wrapper is flagged; after it, setup points you to 5ire > Tools, which it can't read. Offers to add the missing IPv4/IPv6 `/etc/hosts` lines that block 5ire's log shipping (asks before sudo). | see below |
 | `audit` | `secstack audit` (exit 0 passed, 1 issues, 2 something wasn't checked): listeners, pentagi's `.env`, containers and their networks, the restart guard, scope firewall, Docker VM vs plan, permissions, model digests, Ollama origins, the Ollama login item, 5ire hosts, memory, model budget. setup then exits 3 for issues and 2 when something wasn't checked. | |
@@ -39,7 +39,10 @@ Use a native arm64 terminal; setup stops under Rosetta.
    loads, log in with the upstream default `admin@pentagi.com` / `admin`, **change the password**.
 2. Settings > API Tokens > create one and copy it. Save it without echoing and clear the clipboard:
    `(umask 077; pbpaste > ~/GitHub/.sec-ops/env/pentagi-api-token) && pbcopy </dev/null`
-3. `secstack providers --create-only && secstack templates --create-only` (pentagi must be running).
+3. `secstack providers --create-only` (pentagi must be running).
+4. Flow templates: pentagi lets only a browser login manage them (it refuses an API token), so add
+   each `configs/flow-templates/*.md` in its UI under Templates (first line: title; the rest: text).
+   `secstack templates` tries the API and, when pentagi refuses, says so.
 
 `secstack providers` without `--create-only` also updates providers that already exist (after writing a
 backup of them to `$SECOPS/logs/pentagi-providers-backup-<time>.json`); use it after re-planning.
@@ -118,7 +121,7 @@ secstack scope apply             # creates hexstrike-net; firewall on both netwo
 secstack mcp on                  # HexStrike on hexstrike-net (172.30.1.5) with a new token
 secstack pentagi                 # recreates pentagi (terminal ports on 127.0.0.2) + restart guard
                                  # wait until https://127.0.0.1:8443 loads, then:
-secstack providers --create-only && secstack templates --create-only
+secstack providers --create-only # then the flow templates in pentagi's UI ("pentagi by hand")
 ./setup.sh --only 5ire           # what to fix for 5ire; the missing hosts lines
 secstack claude off && secstack claude on   # only if Claude Desktop has the entries on; restart it after
 rm -rf ~/GitHub/hexstrike-ai/hexstrike-env  # the old MCP venv, if it's there

@@ -1578,7 +1578,8 @@ secstack v10: offensive-security workstation control (local abliterated models o
   secstack watch stop [FLOW]
   secstack verify-cve FILE... [--expect vendor[,product]]
   secstack templates [--create-only]
-                                sync configs/flow-templates/*.md into pentagi (pentagi running)
+                                sync configs/flow-templates/*.md into pentagi (pentagi running);
+                                pentagi refuses API tokens here: add them in its UI (Templates)
   secstack providers [--create-only] [--prune]
                                 sync the plan's pentagi providers (pentagi running);
                                 plain = also update existing ones (backup to logs/ first);
